@@ -1,8 +1,11 @@
 import json
 import os
+import platform
 import random
+import sys
 import time
 from collections import defaultdict
+from importlib import metadata
 
 import jax
 import numpy as np
@@ -42,6 +45,142 @@ flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
 
+def _json_default(value):
+    # Convert to JSON
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if hasattr(value, 'to_dict'):
+        return value.to_dict()
+    return str(value)
+
+
+def _write_json(path, data):
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2, sort_keys=True, default=_json_default)
+
+
+def _array_summary(array):
+    return {
+        'shape': list(array.shape),
+        'dtype': str(array.dtype),
+    }
+
+
+def _dataset_summary(name, dataset):
+    summary = {
+        'name': name,
+        'size': int(dataset.size),
+        'keys': sorted(dataset.keys()),
+        'arrays': {key: _array_summary(value) for key, value in dataset.items()},
+    }
+    if 'valids' in dataset:
+        summary['num_valid'] = int(np.sum(dataset['valids'] > 0))
+    if 'terminals' in dataset:
+        terminal_idxs = np.flatnonzero(dataset['terminals'] > 0)
+        summary['num_trajectories'] = int(len(terminal_idxs))
+        if len(terminal_idxs) > 0:
+            initial_idxs = np.concatenate([[0], terminal_idxs[:-1] + 1])
+            lengths = terminal_idxs - initial_idxs + 1
+            summary['trajectory_length'] = {
+                'min': int(np.min(lengths)),
+                'mean': float(np.mean(lengths)),
+                'max': int(np.max(lengths)),
+            }
+    return summary
+
+
+def _goal_dataset_summary(name, goal_dataset):
+    summary = {
+        'name': name,
+        'size': int(goal_dataset.size),
+        'num_trajectories': int(len(goal_dataset.terminal_locs)),
+    }
+    if len(goal_dataset.terminal_locs) > 0:
+        lengths = goal_dataset.terminal_locs - goal_dataset.initial_locs + 1
+        summary['trajectory_length'] = {
+            'min': int(np.min(lengths)),
+            'mean': float(np.mean(lengths)),
+            'max': int(np.max(lengths)),
+        }
+    return summary
+
+
+def _env_summary(env):
+    task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else getattr(env, 'task_infos', [])
+    return {
+        'env_class': f'{type(env).__module__}.{type(env).__name__}',
+        'unwrapped_env_class': f'{type(env.unwrapped).__module__}.{type(env.unwrapped).__name__}',
+        'observation_space': str(env.observation_space),
+        'action_space': str(env.action_space),
+        'num_tasks': len(task_infos),
+        'tasks': [
+            {
+                'task_id': idx + 1,
+                'task_name': task_info.get('task_name', f'task{idx + 1}'),
+            }
+            for idx, task_info in enumerate(task_infos)
+        ],
+    }
+
+
+def _runtime_summary():
+    package_names = [
+        'ogbench',
+        'jax',
+        'jaxlib',
+        'flax',
+        'optax',
+        'distrax',
+        'mujoco',
+        'dm_control',
+        'gymnasium',
+        'wandb',
+        'numpy',
+    ]
+    packages = {}
+    for package_name in package_names:
+        try:
+            packages[package_name] = metadata.version(package_name)
+        except metadata.PackageNotFoundError:
+            packages[package_name] = None
+
+    try:
+        jax_devices = [str(device) for device in jax.devices()]
+        jax_backend_error = None
+    except Exception as exc: #login nodes with CUDA JAX
+        jax_devices = []
+        jax_backend_error = repr(exc)
+
+    return {
+        'python': sys.version,
+        'platform': platform.platform(),
+        'hostname': platform.node(),
+        'cwd': os.getcwd(),
+        'packages': packages,
+        'jax_devices': jax_devices,
+        'jax_backend_error': jax_backend_error,
+        'env_vars': {
+            key: os.environ.get(key)
+            for key in [
+                'CUDA_VISIBLE_DEVICES',
+                'JAX_PLATFORMS',
+                'XLA_PYTHON_CLIENT_PREALLOCATE',
+                'MUJOCO_GL',
+                'WANDB_MODE',
+                'WANDB_DIR',
+                'WANDB_CACHE_DIR',
+                'WANDB_CONFIG_DIR',
+                'SLURM_JOB_ID',
+                'SLURM_JOB_NAME',
+                'SLURM_PROCID',
+                'SLURM_NODELIST',
+            ]
+        },
+    }
+
+
 def main(_):
     # Set up logger.
     exp_name = get_exp_name(FLAGS.seed)
@@ -50,12 +189,32 @@ def main(_):
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     flag_dict = get_flag_dict()
-    with open(os.path.join(FLAGS.save_dir, 'flags.json'), 'w') as f:
-        json.dump(flag_dict, f)
+    _write_json(os.path.join(FLAGS.save_dir, 'flags.json'), flag_dict)
+    _write_json(os.path.join(FLAGS.save_dir, 'runtime.json'), _runtime_summary())
+    _write_json(
+        os.path.join(FLAGS.save_dir, 'wandb.json'),
+        {
+            'mode': getattr(wandb.run.settings, 'mode', None),
+            'id': wandb.run.id,
+            'name': wandb.run.name,
+            'project': wandb.run.project,
+            'group': wandb.run.group,
+            'dir': wandb.run.dir,
+            'path': wandb.run.path,
+        },
+    )
 
     # Set up environment and dataset.
     config = FLAGS.agent
     env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=config['frame_stack'])
+    _write_json(
+        os.path.join(FLAGS.save_dir, 'dataset_raw.json'),
+        {
+            'env': _env_summary(env),
+            'train_dataset': _dataset_summary('train', train_dataset),
+            'val_dataset': _dataset_summary('val', val_dataset),
+        },
+    )
 
     dataset_class = {
         'GCDataset': GCDataset,
@@ -64,6 +223,30 @@ def main(_):
     train_dataset = dataset_class(Dataset.create(**train_dataset), config)
     if val_dataset is not None:
         val_dataset = dataset_class(Dataset.create(**val_dataset), config)
+    _write_json(
+        os.path.join(FLAGS.save_dir, 'dataset_goal_conditioned.json'),
+        {
+            'dataset_class': config['dataset_class'],
+            'train_dataset': _goal_dataset_summary('train', train_dataset),
+            'val_dataset': _goal_dataset_summary('val', val_dataset) if val_dataset is not None else None,
+            'goal_sampling': {
+                key: config[key]
+                for key in [
+                    'value_p_curgoal',
+                    'value_p_trajgoal',
+                    'value_p_randomgoal',
+                    'value_geom_sample',
+                    'actor_p_curgoal',
+                    'actor_p_trajgoal',
+                    'actor_p_randomgoal',
+                    'actor_geom_sample',
+                    'gc_negative',
+                    'p_aug',
+                    'frame_stack',
+                ]
+            },
+        },
+    )
 
     # Initialize agent.
     random.seed(FLAGS.seed)
