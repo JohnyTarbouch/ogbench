@@ -10,3 +10,6 @@ impls/exp/
 wandb/
 *.out
 *.err
+
+impls/docs
+impls/scripts

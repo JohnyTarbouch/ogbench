@@ -32,6 +32,7 @@ train = [
     "ml_collections",
     "matplotlib",
     "moviepy",
+    "scikit-learn",
     "wandb",
 ]
 dev = [

@@ -22,6 +22,8 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-50}"
 EVAL_TASKS="${EVAL_TASKS:-1}"
 EVAL_EPISODES="${EVAL_EPISODES:-2}"
 VIDEO_EPISODES="${VIDEO_EPISODES:-1}"
+AGENT_CONFIG="${AGENT_CONFIG:-agents/gcbc.py}"
+AGENT_EXTRA_ARGS="${AGENT_EXTRA_ARGS:-}"
 
 export HOME="/bigwork/nhwptarj"
 export TMPDIR="${TMPDIR:-/bigwork/nhwptarj/tmp}"
@@ -59,6 +61,8 @@ echo "eval_interval: $EVAL_INTERVAL"
 echo "eval_tasks: $EVAL_TASKS"
 echo "eval_episodes: $EVAL_EPISODES"
 echo "video_episodes: $VIDEO_EPISODES"
+echo "agent_config: $AGENT_CONFIG"
+echo "agent_extra_args: $AGENT_EXTRA_ARGS"
 echo "xla_preallocate: $XLA_PYTHON_CLIENT_PREALLOCATE"
 
 python - <<'PY'
@@ -72,6 +76,7 @@ fi
 
 declare -a pids=()
 declare -A pid_to_seed=()
+read -r -a agent_extra_args <<< "$AGENT_EXTRA_ARGS"
 
 for seed in $SEEDS; do
   seed_log="$PROCESS_LOG_DIR/seed_${seed}.out"
@@ -81,7 +86,7 @@ for seed in $SEEDS; do
     python main.py \
       --env_name="$ENV_NAME" \
       --seed="$seed" \
-      --agent=agents/gcbc.py \
+      --agent="$AGENT_CONFIG" \
       --train_steps="$TRAIN_STEPS" \
       --log_interval="$LOG_INTERVAL" \
       --eval_interval="$EVAL_INTERVAL" \
@@ -90,7 +95,8 @@ for seed in $SEEDS; do
       --video_episodes="$VIDEO_EPISODES" \
       --save_interval=1000000 \
       --save_dir="$SAVE_DIR" \
-      --run_group="$RUN_GROUP"
+      --run_group="$RUN_GROUP" \
+      "${agent_extra_args[@]}"
   ) >"$seed_log" 2>&1 &
   pid=$!
   pids+=("$pid")

@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import platform
@@ -19,6 +20,7 @@ from utils.env_utils import make_env_and_datasets
 from utils.evaluation import evaluate
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
+from utils.stitch_datasets import TemporalStitchGCDataset
 
 FLAGS = flags.FLAGS
 
@@ -59,6 +61,19 @@ def _json_default(value):
 def _write_json(path, data):
     with open(path, 'w') as f:
         json.dump(data, f, indent=2, sort_keys=True, default=_json_default)
+
+
+def _append_csv_rows(path, rows, step):
+    if not rows:
+        return
+    fieldnames = ['step'] + list(rows[0].keys())
+    file_exists = os.path.exists(path)
+    with open(path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow({'step': step, **row})
 
 
 def _array_summary(array):
@@ -219,14 +234,18 @@ def main(_):
     dataset_class = {
         'GCDataset': GCDataset,
         'HGCDataset': HGCDataset,
+        'TemporalStitchGCDataset': TemporalStitchGCDataset,
     }[config['dataset_class']]
     train_dataset = dataset_class(Dataset.create(**train_dataset), config)
     if val_dataset is not None:
-        val_dataset = dataset_class(Dataset.create(**val_dataset), config)
+        val_dataset_class = GCDataset if config['dataset_class'] == 'TemporalStitchGCDataset' else dataset_class
+        val_dataset = val_dataset_class(Dataset.create(**val_dataset), config)
     _write_json(
         os.path.join(FLAGS.save_dir, 'dataset_goal_conditioned.json'),
         {
             'dataset_class': config['dataset_class'],
+            'train_dataset_class': train_dataset.__class__.__name__,
+            'val_dataset_class': val_dataset.__class__.__name__ if val_dataset is not None else None,
             'train_dataset': _goal_dataset_summary('train', train_dataset),
             'val_dataset': _goal_dataset_summary('val', val_dataset) if val_dataset is not None else None,
             'goal_sampling': {
@@ -243,8 +262,25 @@ def main(_):
                     'gc_negative',
                     'p_aug',
                     'frame_stack',
+                    'stitch_p_aug',
+                    'stitch_radius',
+                    'stitch_space',
+                    'stitch_xy_dims',
+                    'stitch_future_min',
+                    'stitch_cross_traj_only',
+                    'stitch_mode',
+                    'stitch_nclusters',
+                    'stitch_kmeans_n_init',
+                    'stitch_kmeans_random_state',
+                    'stitch_debug_samples',
+                    'stitch_state_normalize',
+                    'stitch_state_normalize_eps',
+                    'stitch_state_xy_weight',
+                    'stitch_state_xy_max_dist',
                 ]
+                if key in config
             },
+            'stitching': getattr(train_dataset, 'stitch_summary', None),
         },
     )
 
@@ -253,6 +289,10 @@ def main(_):
     np.random.seed(FLAGS.seed)
 
     example_batch = train_dataset.sample(1)
+    if hasattr(train_dataset, 'get_and_reset_diagnostics'):
+        train_dataset.get_and_reset_diagnostics()
+    if hasattr(train_dataset, 'get_and_reset_debug_records'):
+        train_dataset.get_and_reset_debug_records()
     if config['discrete']:
         # Fill with the maximum action to let the agent know the action space size.
         example_batch['actions'] = np.full_like(example_batch['actions'], env.action_space.n - 1)
@@ -272,6 +312,7 @@ def main(_):
     # Train agent.
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'train.csv'))
     eval_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'eval.csv'))
+    stitch_debug_path = os.path.join(FLAGS.save_dir, 'stitch_debug.csv')
     first_time = time.time()
     last_time = time.time()
     for i in tqdm.tqdm(range(1, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
@@ -283,9 +324,13 @@ def main(_):
         if i % FLAGS.log_interval == 0:
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             if val_dataset is not None:
-                val_batch = val_dataset.sample(config['batch_size'])
+                val_batch = val_dataset.sample(config['batch_size'], evaluation=True)
                 _, val_info = agent.total_loss(val_batch, grad_params=None)
                 train_metrics.update({f'validation/{k}': v for k, v in val_info.items()})
+            if hasattr(train_dataset, 'get_and_reset_diagnostics'):
+                train_metrics.update(train_dataset.get_and_reset_diagnostics())
+            if hasattr(train_dataset, 'get_and_reset_debug_records'):
+                _append_csv_rows(stitch_debug_path, train_dataset.get_and_reset_debug_records(), i)
             train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval
             train_metrics['time/total_time'] = time.time() - first_time
             last_time = time.time()
