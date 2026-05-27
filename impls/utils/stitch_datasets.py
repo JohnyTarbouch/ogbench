@@ -40,6 +40,7 @@ class TemporalStitchGCDataset(GCDataset):
     - stitch_state_normalize_eps: Minimum standard deviation used for state normalization.
     - stitch_state_xy_weight: State-only ablation; upweight XY dimensions in the K-means feature space.
     - stitch_state_xy_max_dist: State-only ablation; positive values reject waypoint candidates farther than this in true XY.
+    - stitch_guard_mode: Optional manipulation guard. 'none' preserves the original navigation 
     """
 
     def __post_init__(self):
@@ -67,6 +68,22 @@ class TemporalStitchGCDataset(GCDataset):
         self.stitch_state_xy_max_dist = float(self._config_get('stitch_state_xy_max_dist', -1.0))
         if self.stitch_state_xy_max_dist <= 0:
             self.stitch_state_xy_max_dist = None
+        self.stitch_guard_mode = self._config_get('stitch_guard_mode', 'none')
+        self.stitch_guard_max_retries = int(self._config_get('stitch_guard_max_retries', 16))
+        self.stitch_guard_exhaustive_fallback = bool(self._config_get('stitch_guard_exhaustive_fallback', True))
+        self.stitch_guard_position_scale = float(self._config_get('stitch_guard_position_scale', 1.0))
+        self.stitch_guard_xy_max_dist = float(self._config_get('stitch_guard_xy_max_dist', -1.0))
+        self.stitch_guard_effector_dims = tuple(self._config_get('stitch_guard_effector_dims', ()))
+        self.stitch_guard_object_dims = tuple(self._config_get('stitch_guard_object_dims', self.stitch_xy_dims))
+        self.stitch_guard_effector_max_dist = float(self._config_get('stitch_guard_effector_max_dist', -1.0))
+        self.stitch_guard_rel_effector_object_max_dist = float(
+            self._config_get('stitch_guard_rel_effector_object_max_dist', -1.0)
+        )
+        self.stitch_guard_gripper_open_dim = int(self._config_get('stitch_guard_gripper_open_dim', -1))
+        self.stitch_guard_gripper_open_scale = float(self._config_get('stitch_guard_gripper_open_scale', 1.0))
+        self.stitch_guard_gripper_open_max_diff = float(self._config_get('stitch_guard_gripper_open_max_diff', -1.0))
+        self.stitch_guard_contact_dim = int(self._config_get('stitch_guard_contact_dim', -1))
+        self.stitch_guard_contact_max_diff = float(self._config_get('stitch_guard_contact_max_diff', -1.0))
         self.stitch_enabled = self.stitch_p_aug > 0
         self._stitch_metric_sums = {}
         self._stitch_metric_count = 0
@@ -94,6 +111,20 @@ class TemporalStitchGCDataset(GCDataset):
             'stitch_state_normalize_eps': self.stitch_state_normalize_eps,
             'stitch_state_xy_weight': self.stitch_state_xy_weight,
             'stitch_state_xy_max_dist': self.stitch_state_xy_max_dist,
+            'stitch_guard_mode': self.stitch_guard_mode,
+            'stitch_guard_max_retries': self.stitch_guard_max_retries,
+            'stitch_guard_exhaustive_fallback': self.stitch_guard_exhaustive_fallback,
+            'stitch_guard_position_scale': self.stitch_guard_position_scale,
+            'stitch_guard_xy_max_dist': self.stitch_guard_xy_max_dist,
+            'stitch_guard_effector_dims': list(self.stitch_guard_effector_dims),
+            'stitch_guard_object_dims': list(self.stitch_guard_object_dims),
+            'stitch_guard_effector_max_dist': self.stitch_guard_effector_max_dist,
+            'stitch_guard_rel_effector_object_max_dist': self.stitch_guard_rel_effector_object_max_dist,
+            'stitch_guard_gripper_open_dim': self.stitch_guard_gripper_open_dim,
+            'stitch_guard_gripper_open_scale': self.stitch_guard_gripper_open_scale,
+            'stitch_guard_gripper_open_max_diff': self.stitch_guard_gripper_open_max_diff,
+            'stitch_guard_contact_dim': self.stitch_guard_contact_dim,
+            'stitch_guard_contact_max_diff': self.stitch_guard_contact_max_diff,
         }
 
         if not self.stitch_enabled:
@@ -119,6 +150,14 @@ class TemporalStitchGCDataset(GCDataset):
             raise ValueError('stitch_state_normalize_eps must be positive.')
         if self.stitch_state_xy_weight <= 0:
             raise ValueError('stitch_state_xy_weight must be positive.')
+        if self.stitch_guard_mode not in ('none', 'cube_gripper'):
+            raise ValueError("stitch_guard_mode must be one of {'none', 'cube_gripper'}.")
+        if self.stitch_guard_max_retries <= 0:
+            raise ValueError('stitch_guard_max_retries must be positive.')
+        if self.stitch_guard_position_scale <= 0:
+            raise ValueError('stitch_guard_position_scale must be positive.')
+        if self.stitch_guard_gripper_open_scale <= 0:
+            raise ValueError('stitch_guard_gripper_open_scale must be positive.')
         observations = self.dataset['observations']
         if not isinstance(observations, np.ndarray) or observations.ndim != 2:
             raise ValueError('TemporalStitchGCDataset expects state observations as a 2D numpy array.')
@@ -126,8 +165,27 @@ class TemporalStitchGCDataset(GCDataset):
             raise ValueError(
                 f'stitch_xy_dims={self.stitch_xy_dims} incompatible with observation shape {observations.shape}.'
             )
+        if self.stitch_guard_mode != 'none':
+            guard_dims = list(self.stitch_guard_effector_dims) + list(self.stitch_guard_object_dims)
+            if self.stitch_guard_gripper_open_dim >= 0:
+                guard_dims.append(self.stitch_guard_gripper_open_dim)
+            if self.stitch_guard_contact_dim >= 0:
+                guard_dims.append(self.stitch_guard_contact_dim)
+            if not guard_dims:
+                raise ValueError('stitch_guard_mode requires at least one guard dimension.')
+            if max(guard_dims) >= observations.shape[-1] or min(guard_dims) < 0:
+                raise ValueError(
+                    f'stitch guard dimensions incompatible with observation shape {observations.shape}.'
+                )
+            if self.stitch_guard_rel_effector_object_max_dist > 0 and (
+                len(self.stitch_guard_effector_dims) != len(self.stitch_guard_object_dims)
+            ):
+                raise ValueError(
+                    'stitch_guard_rel_effector_object_max_dist requires effector/object dims of equal length.'
+                )
 
         self.stitch_xy_points = observations[:, list(self.stitch_xy_dims)].astype(np.float32)
+        self.stitch_observations = observations.astype(np.float32)
         if self.stitch_space == 'state':
             self.stitch_points = observations.astype(np.float32)
             if self.stitch_state_normalize:
@@ -287,6 +345,10 @@ class TemporalStitchGCDataset(GCDataset):
         stitch_distances = []
         xy_distances = []
         future_offsets = []
+        effector_distances = []
+        rel_effector_object_distances = []
+        gripper_open_distances = []
+        contact_distances = []
 
         if len(attempt_positions) > 0:
             if self.stitch_mode == 'kmeans':
@@ -310,6 +372,7 @@ class TemporalStitchGCDataset(GCDataset):
                     xy_distance,
                     candidate_count,
                     guarded_candidate_count,
+                    guard_stats,
                 ) = waypoint_info
                 waypoint_traj = self.traj_ids[waypoint_idx]
                 terminal_idx = int(self.terminal_locs[waypoint_traj])
@@ -325,6 +388,13 @@ class TemporalStitchGCDataset(GCDataset):
                 stitch_distances.append(stitch_distance)
                 xy_distances.append(xy_distance)
                 future_offsets.append(new_goal_idx - waypoint_idx)
+                self._append_guard_metric(effector_distances, guard_stats.get('effector_distance'))
+                self._append_guard_metric(
+                    rel_effector_object_distances,
+                    guard_stats.get('rel_effector_object_distance'),
+                )
+                self._append_guard_metric(gripper_open_distances, guard_stats.get('gripper_open_distance'))
+                self._append_guard_metric(contact_distances, guard_stats.get('contact_distance'))
                 self._maybe_record_stitch_debug(
                     batch_pos=batch_pos,
                     sample_idx=sample_idx,
@@ -335,6 +405,7 @@ class TemporalStitchGCDataset(GCDataset):
                     xy_distance=xy_distance,
                     candidate_count=candidate_count,
                     guarded_candidate_count=guarded_candidate_count,
+                    guard_stats=guard_stats,
                 )
 
         attempted = len(attempt_positions)
@@ -354,9 +425,28 @@ class TemporalStitchGCDataset(GCDataset):
                 'goal_waypoint_distance_mean': float(np.mean(stitch_distances)) if stitch_distances else np.nan,
                 'goal_waypoint_xy_distance_mean': float(np.mean(xy_distances)) if xy_distances else np.nan,
                 'future_offset_mean': float(np.mean(future_offsets)) if future_offsets else np.nan,
+                'goal_waypoint_effector_distance_mean': (
+                    float(np.mean(effector_distances)) if effector_distances else np.nan
+                ),
+                'goal_waypoint_rel_effector_object_distance_mean': (
+                    float(np.mean(rel_effector_object_distances)) if rel_effector_object_distances else np.nan
+                ),
+                'goal_waypoint_gripper_open_distance_mean': (
+                    float(np.mean(gripper_open_distances)) if gripper_open_distances else np.nan
+                ),
+                'goal_waypoint_contact_distance_mean': (
+                    float(np.mean(contact_distances)) if contact_distances else np.nan
+                ),
             }
         )
         return augmented_goal_idxs
+
+    def _append_guard_metric(self, values, value):
+        if value is None:
+            return
+        if np.isnan(value):
+            return
+        values.append(float(value))
 
     def sample_waypoints_kmeans(self, sample_idxs, original_goal_idxs):
         # sample waypoint states from the same precomputed k-means cluster as the original goal
@@ -381,6 +471,7 @@ class TemporalStitchGCDataset(GCDataset):
             return None
 
         original_candidate_count = int(len(candidates))
+        original_goal_idx = int(original_goal_idx)
         if self.stitch_cross_traj_only:
             sample_traj = self.traj_ids[int(sample_idx)]
             candidates = candidates[self.traj_ids[candidates] != sample_traj]
@@ -388,37 +479,156 @@ class TemporalStitchGCDataset(GCDataset):
                 return None
 
         guarded_candidate_count = int(len(candidates))
-        if self.stitch_space == 'state' and self.stitch_state_xy_max_dist is not None:
-            original_goal_xy = self.stitch_xy_points[int(original_goal_idx)]
-            for _ in range(16):
-                waypoint_idx = int(candidates[np.random.randint(len(candidates))])
-                xy_distance = float(np.linalg.norm(self.stitch_xy_points[waypoint_idx] - original_goal_xy))
-                if xy_distance <= self.stitch_state_xy_max_dist:
-                    stitch_distance = float(
-                        np.linalg.norm(self.stitch_points[waypoint_idx] - self.stitch_points[int(original_goal_idx)])
-                    )
-                    return (
-                        waypoint_idx,
-                        stitch_distance,
-                        xy_distance,
-                        original_candidate_count,
-                        guarded_candidate_count,
-                    )
+        for _ in range(self.stitch_guard_max_retries):
+            waypoint_idx = int(candidates[np.random.randint(len(candidates))])
+            if self._candidate_passes_guards(original_goal_idx, waypoint_idx):
+                return self._format_waypoint_result(
+                    original_goal_idx,
+                    waypoint_idx,
+                    original_candidate_count,
+                    guarded_candidate_count,
+                )
 
-            xy_distances = np.linalg.norm(self.stitch_xy_points[candidates] - original_goal_xy, axis=1)
-            candidates = candidates[xy_distances <= self.stitch_state_xy_max_dist]
+        if self._uses_any_candidate_guard() and self.stitch_guard_exhaustive_fallback:
+            guard_mask = self._candidate_guard_mask(original_goal_idx, candidates)
+            candidates = candidates[guard_mask]
             guarded_candidate_count = int(len(candidates))
             if guarded_candidate_count == 0:
                 return None
 
         waypoint_idx = int(candidates[np.random.randint(len(candidates))])
+        if not self._candidate_passes_guards(original_goal_idx, waypoint_idx):
+            return None
+        return self._format_waypoint_result(
+            original_goal_idx,
+            waypoint_idx,
+            original_candidate_count,
+            guarded_candidate_count,
+        )
+
+    def _format_waypoint_result(self, original_goal_idx, waypoint_idx, original_candidate_count, guarded_candidate_count):
         stitch_distance = float(
-            np.linalg.norm(self.stitch_points[waypoint_idx] - self.stitch_points[int(original_goal_idx)])
+            np.linalg.norm(self.stitch_points[waypoint_idx] - self.stitch_points[original_goal_idx])
         )
         xy_distance = float(
-            np.linalg.norm(self.stitch_xy_points[waypoint_idx] - self.stitch_xy_points[int(original_goal_idx)])
+            np.linalg.norm(self.stitch_xy_points[waypoint_idx] - self.stitch_xy_points[original_goal_idx])
         )
-        return waypoint_idx, stitch_distance, xy_distance, original_candidate_count, guarded_candidate_count
+        guard_stats = self._guard_stats(original_goal_idx, waypoint_idx)
+        return (
+            waypoint_idx,
+            stitch_distance,
+            xy_distance,
+            original_candidate_count,
+            guarded_candidate_count,
+            guard_stats,
+        )
+
+    def _uses_any_candidate_guard(self):
+        return (self.stitch_space == 'state' and self.stitch_state_xy_max_dist is not None) or (
+            self.stitch_guard_mode != 'none'
+            or self.stitch_guard_xy_max_dist > 0
+        )
+
+    def _candidate_passes_guards(self, original_goal_idx, waypoint_idx):
+        if self.stitch_space == 'state' and self.stitch_state_xy_max_dist is not None:
+            xy_distance = float(
+                np.linalg.norm(self.stitch_xy_points[waypoint_idx] - self.stitch_xy_points[original_goal_idx])
+            )
+            if xy_distance > self.stitch_state_xy_max_dist:
+                return False
+        if self.stitch_guard_xy_max_dist > 0:
+            xy_distance = float(
+                np.linalg.norm(self.stitch_xy_points[waypoint_idx] - self.stitch_xy_points[original_goal_idx])
+                / self.stitch_guard_position_scale
+            )
+            if xy_distance > self.stitch_guard_xy_max_dist:
+                return False
+        if self.stitch_guard_mode == 'none':
+            return True
+        guard_stats = self._guard_stats(original_goal_idx, waypoint_idx)
+        return self._guard_stats_pass(guard_stats)
+
+    def _candidate_guard_mask(self, original_goal_idx, candidates):
+        mask = np.ones(len(candidates), dtype=bool)
+        if self.stitch_space == 'state' and self.stitch_state_xy_max_dist is not None:
+            xy_distances = np.linalg.norm(self.stitch_xy_points[candidates] - self.stitch_xy_points[original_goal_idx], axis=1)
+            mask &= xy_distances <= self.stitch_state_xy_max_dist
+        if self.stitch_guard_xy_max_dist > 0:
+            xy_distances = (
+                np.linalg.norm(self.stitch_xy_points[candidates] - self.stitch_xy_points[original_goal_idx], axis=1)
+                / self.stitch_guard_position_scale
+            )
+            mask &= xy_distances <= self.stitch_guard_xy_max_dist
+        if self.stitch_guard_mode != 'none':
+            guard_stats = self._guard_stats(original_goal_idx, candidates)
+            mask &= self._guard_stats_pass(guard_stats)
+        return mask
+
+    def _guard_stats(self, original_goal_idx, waypoint_idx_or_idxs):
+        if self.stitch_guard_mode == 'none':
+            return {
+                'effector_distance': np.nan,
+                'rel_effector_object_distance': np.nan,
+                'gripper_open_distance': np.nan,
+                'contact_distance': np.nan,
+            }
+
+        obs_goal = self.stitch_observations[original_goal_idx]
+        obs_waypoint = self.stitch_observations[waypoint_idx_or_idxs]
+        stats = {
+            'effector_distance': np.nan,
+            'rel_effector_object_distance': np.nan,
+            'gripper_open_distance': np.nan,
+            'contact_distance': np.nan,
+        }
+
+        if len(self.stitch_guard_effector_dims) > 0:
+            goal_eff = obs_goal[list(self.stitch_guard_effector_dims)]
+            waypoint_eff = obs_waypoint[..., list(self.stitch_guard_effector_dims)]
+            stats['effector_distance'] = (
+                np.linalg.norm(waypoint_eff - goal_eff, axis=-1) / self.stitch_guard_position_scale
+            )
+
+        if (
+            self.stitch_guard_rel_effector_object_max_dist > 0
+            and len(self.stitch_guard_effector_dims) > 0
+            and len(self.stitch_guard_object_dims) > 0
+        ):
+            goal_eff = obs_goal[list(self.stitch_guard_effector_dims)]
+            waypoint_eff = obs_waypoint[..., list(self.stitch_guard_effector_dims)]
+            goal_obj = obs_goal[list(self.stitch_guard_object_dims)]
+            waypoint_obj = obs_waypoint[..., list(self.stitch_guard_object_dims)]
+            stats['rel_effector_object_distance'] = (
+                np.linalg.norm((waypoint_eff - waypoint_obj) - (goal_eff - goal_obj), axis=-1)
+                / self.stitch_guard_position_scale
+            )
+
+        if self.stitch_guard_gripper_open_dim >= 0:
+            stats['gripper_open_distance'] = (
+                np.abs(obs_waypoint[..., self.stitch_guard_gripper_open_dim] - obs_goal[self.stitch_guard_gripper_open_dim])
+                / self.stitch_guard_gripper_open_scale
+            )
+
+        if self.stitch_guard_contact_dim >= 0:
+            stats['contact_distance'] = np.abs(
+                obs_waypoint[..., self.stitch_guard_contact_dim] - obs_goal[self.stitch_guard_contact_dim]
+            )
+
+        return stats
+
+    def _guard_stats_pass(self, guard_stats):
+        mask = True
+        if self.stitch_guard_effector_max_dist > 0:
+            mask = mask & (guard_stats['effector_distance'] <= self.stitch_guard_effector_max_dist)
+        if self.stitch_guard_rel_effector_object_max_dist > 0:
+            mask = mask & (
+                guard_stats['rel_effector_object_distance'] <= self.stitch_guard_rel_effector_object_max_dist
+            )
+        if self.stitch_guard_gripper_open_max_diff > 0:
+            mask = mask & (guard_stats['gripper_open_distance'] <= self.stitch_guard_gripper_open_max_diff)
+        if self.stitch_guard_contact_max_diff >= 0:
+            mask = mask & (guard_stats['contact_distance'] <= self.stitch_guard_contact_max_diff)
+        return mask
 
     def _maybe_record_stitch_debug(
         self,
@@ -431,6 +641,7 @@ class TemporalStitchGCDataset(GCDataset):
         xy_distance,
         candidate_count,
         guarded_candidate_count,
+        guard_stats,
     ):
         if self.stitch_debug_samples <= 0 or len(self._stitch_debug_records) >= self.stitch_debug_samples:
             return
@@ -465,6 +676,7 @@ class TemporalStitchGCDataset(GCDataset):
                 'goal_waypoint_xy_distance': float(xy_distance),
                 'candidate_count': int(candidate_count),
                 'candidate_count_after_xy_guard': int(guarded_candidate_count),
+                'candidate_count_after_guard': int(guarded_candidate_count),
                 'stitch_space': self.stitch_space,
                 'stitch_state_normalize': int(self.stitch_state_normalize),
                 'stitch_state_xy_weight': float(self.stitch_state_xy_weight),
@@ -473,6 +685,16 @@ class TemporalStitchGCDataset(GCDataset):
                     if self.stitch_state_xy_max_dist is not None
                     else np.nan
                 ),
+                'stitch_guard_mode': self.stitch_guard_mode,
+                'stitch_guard_xy_max_dist': float(self.stitch_guard_xy_max_dist),
+                'goal_waypoint_effector_distance': float(guard_stats.get('effector_distance', np.nan)),
+                'goal_waypoint_rel_effector_object_distance': float(
+                    guard_stats.get('rel_effector_object_distance', np.nan)
+                ),
+                'goal_waypoint_gripper_open_distance': float(
+                    guard_stats.get('gripper_open_distance', np.nan)
+                ),
+                'goal_waypoint_contact_distance': float(guard_stats.get('contact_distance', np.nan)),
                 'future_offset': int(new_goal_idx - waypoint_idx),
                 'cross_trajectory': int(sample_traj != waypoint_traj),
             }
