@@ -1,6 +1,7 @@
 import os
 import tempfile
 from datetime import datetime
+from hashlib import blake2s
 
 import absl.flags as flags
 import ml_collections
@@ -70,7 +71,13 @@ def setup_wandb(
     mode = os.environ.get('WANDB_MODE', mode)
     wandb_output_dir = os.environ.get('WANDB_DIR') or tempfile.mkdtemp()
     os.makedirs(wandb_output_dir, exist_ok=True)
-    tags = [group] if group is not None else None
+    tags = None
+    if group is not None:
+        group_tag = str(group)
+        if len(group_tag) > 64:
+            digest = blake2s(group_tag.encode('utf-8'), digest_size=4).hexdigest()
+            group_tag = f'{group_tag[:55]}-{digest}'
+        tags = [group_tag]
 
     init_kwargs = dict(
         config=get_flag_dict(),
