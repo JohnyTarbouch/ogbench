@@ -1,11 +1,3 @@
-"""Temporal stitching dataset extensions for OGBench GCBC experiments.
-
-This module keeps the temporal stitching/relabeling implementation separate from
-OGBench's original dataset utilities. Plain OGBench runs continue to use
-``utils.datasets.GCDataset``; experiments opt into this class with
-``agent.dataset_class=TemporalStitchGCDataset``.
-"""
-
 from __future__ import annotations
 
 import dataclasses
@@ -18,29 +10,28 @@ from utils.datasets import GCDataset
 
 @dataclasses.dataclass
 class TemporalStitchGCDataset(GCDataset):
-    """Goal-conditioned dataset with temporal stitching augmentation.
+    """
+    Goal-conditioned dataset with temporal stitching augmentation.
 
-    The default GCDataset samples actor goals from the future of the same trajectory.
-    This subclass keeps that behavior and, with probability stitch_p_aug,
-    replaces the sampled actor goal with a future goal from another trajectory
-    that passes through the same precomputed state group as the original actor goal.
+    GCDataset sample goals a future state of the same trajectory as goal.
+    With probability stitch_p_aug, replaces the sampled goal with a future goal from
+    another trajectory that passes through the same state group as the original goal.
 
     Additional config keys:
     - stitch_p_aug: Probability of trying to replace goal
-    - stitch_radius: XY bucket size when stitch_mode is bucket.
-    - stitch_space: K-means cluster space. state matches the original code, xy is an ablation.
-    - stitch_xy_dims: Observation dimensions used for XY matching and debug logging.
-    - stitch_future_min: Minimum future offset after the waypoint for the augmented goal.
-    - stitch_cross_traj_only: Whether waypoints must come from a different trajectory.
-    - stitch_mode: Waypoint grouping mode. kmeans follows the paper, 'bucket' is a fast ablation.
-    - stitch_nclusters: Number of k-means clusters.
-    - stitch_kmeans_n_init: Number of k-means initializations.
-    - stitch_kmeans_random_state: Random state for reproducible k-means clusters.
-    - stitch_state_normalize: State-only ablation; z-score full-state features before K-means.
-    - stitch_state_normalize_eps: Minimum standard deviation used for state normalization.
-    - stitch_state_xy_weight: State-only ablation; upweight XY dimensions in the K-means feature space.
-    - stitch_state_xy_max_dist: State-only ablation; positive values reject waypoint candidates farther than this in true XY.
-    - stitch_guard_mode: Optional manipulation guard. 'none' preserves the original navigation 
+    - stitch_space: k-means cluster space. state matches the original code
+    - stitch_xy_dims: Observation dim used for XY matching
+    - stitch_future_min: Minimum future offset after the waypoint for the augmented goal
+    - stitch_future_max: Maximum future offset after the waypoint for the augmented goal. Negative disables it
+    - stitch_cross_traj_only: if waypoints must come from a different trajectory
+    - stitch_nclusters: Number of k-means clusters
+    - stitch_kmeans_n_init: Number of k-means init
+    - stitch_kmeans_random_state: random state for reproducible k-mean
+    - stitch_state_normalize: State-only , z-score full-state features before K-means
+    - stitch_state_normalize_eps: Minimum standard deviation used for state normalization
+    - stitch_state_xy_weight: upweight XY dim in the K-means feature space
+    - stitch_state_xy_max_dist: positive values reject waypoint candidates farther than this in true XY
+    - stitch_guard_mode: manipulation guard 
     """
 
     def __post_init__(self):
@@ -52,12 +43,12 @@ class TemporalStitchGCDataset(GCDataset):
 
     def _init_stitching(self):
         self.stitch_p_aug = float(self._config_get('stitch_p_aug', 0.0))
-        self.stitch_radius = float(self._config_get('stitch_radius', 0.5))
         self.stitch_space = self._config_get('stitch_space', 'state')
         self.stitch_xy_dims = tuple(self._config_get('stitch_xy_dims', (0, 1)))
         self.stitch_future_min = int(self._config_get('stitch_future_min', 0))
+        stitch_future_max = int(self._config_get('stitch_future_max', -1))
+        self.stitch_future_max = None if stitch_future_max < 0 else stitch_future_max
         self.stitch_cross_traj_only = bool(self._config_get('stitch_cross_traj_only', False))
-        self.stitch_mode = self._config_get('stitch_mode', 'kmeans')
         self.stitch_nclusters = int(self._config_get('stitch_nclusters', 40))
         self.stitch_kmeans_n_init = self._config_get('stitch_kmeans_n_init', 'auto')
         self.stitch_kmeans_random_state = self._config_get('stitch_kmeans_random_state', None)
@@ -97,12 +88,11 @@ class TemporalStitchGCDataset(GCDataset):
         self.stitch_summary = {
             'enabled': bool(self.stitch_enabled),
             'stitch_p_aug': self.stitch_p_aug,
-            'stitch_radius': self.stitch_radius,
             'stitch_space': self.stitch_space,
             'stitch_xy_dims': list(self.stitch_xy_dims),
             'stitch_future_min': self.stitch_future_min,
+            'stitch_future_max': self.stitch_future_max,
             'stitch_cross_traj_only': self.stitch_cross_traj_only,
-            'stitch_mode': self.stitch_mode,
             'stitch_nclusters': self.stitch_nclusters,
             'stitch_kmeans_n_init': self.stitch_kmeans_n_init,
             'stitch_kmeans_random_state': self.stitch_kmeans_random_state,
@@ -130,7 +120,6 @@ class TemporalStitchGCDataset(GCDataset):
         if not self.stitch_enabled:
             self.stitch_points = None
             self.stitch_xy_points = None
-            self.stitch_buckets = {}
             self.stitch_cluster_labels = None
             self.stitch_cluster_to_waypoint_idxs = {}
             self.stitch_summary.update({'num_waypoints': 0, 'num_groups': 0})
@@ -138,14 +127,12 @@ class TemporalStitchGCDataset(GCDataset):
 
         if self.stitch_space not in ('state', 'xy'):
             raise ValueError("stitch_space must be one of {'state', 'xy'}.")
-        if self.stitch_mode not in ('kmeans', 'bucket'):
-            raise ValueError("stitch_mode must be one of {'kmeans', 'bucket'}.")
-        if self.stitch_mode == 'bucket' and self.stitch_space != 'xy':
-            raise ValueError("stitch_mode='bucket' requires stitch_space='xy'.")
-        if self.stitch_mode == 'bucket' and self.stitch_radius <= 0:
-            raise ValueError("stitch_radius must be positive when stitch_mode='bucket'.")
-        if self.stitch_mode == 'kmeans' and self.stitch_nclusters <= 0:
-            raise ValueError("stitch_nclusters must be positive when stitch_mode='kmeans'.")
+        if self.stitch_nclusters <= 0:
+            raise ValueError('stitch_nclusters must be positive.')
+        if self.stitch_future_min < 0:
+            raise ValueError('stitch_future_min must be non-negative.')
+        if self.stitch_future_max is not None and self.stitch_future_max < self.stitch_future_min:
+            raise ValueError('stitch_future_max must be >= stitch_future_min, or negative to disable it.')
         if self.stitch_state_normalize_eps <= 0:
             raise ValueError('stitch_state_normalize_eps must be positive.')
         if self.stitch_state_xy_weight <= 0:
@@ -213,22 +200,17 @@ class TemporalStitchGCDataset(GCDataset):
         ]
         self.valid_waypoint_idxs = valid_waypoint_idxs.astype(np.int64)
 
-        self.stitch_buckets = {}
         self.stitch_cluster_labels = None
         self.stitch_cluster_to_waypoint_idxs = {}
-        if self.stitch_mode == 'kmeans':
-            self._build_kmeans_groups()
-        else:
-            self._build_bucket_groups()
+        self._build_kmeans_groups()
 
     def _build_kmeans_groups(self):
-        # Cluster all states once, as in the paper.
+        # cluster all states once
         try:
             from sklearn.cluster import KMeans
         except ImportError as exc:
             raise ImportError(
-                "stitch_mode='kmeans' requires scikit-learn. Install it with "
-                "`python -m pip install scikit-learn` or reinstall OGBench with the train extra."
+                "TemporalStitchGCDataset requires scikit-learn. Install it with "
             ) from exc
 
         kmeans = KMeans(
@@ -252,25 +234,6 @@ class TemporalStitchGCDataset(GCDataset):
                 'group_size_mean': float(np.mean(group_sizes)) if len(group_sizes) else 0.0,
                 'group_size_max': int(np.max(group_sizes)) if len(group_sizes) else 0,
                 'kmeans_inertia': float(kmeans.inertia_),
-            }
-        )
-
-    def _build_bucket_groups(self):
-        # Assign states to XY grid buckets once (not the paper implementation)
-        self.stitch_buckets = {}
-        bucket_coords = np.floor(self.stitch_points[self.valid_waypoint_idxs] / self.stitch_radius).astype(np.int64)
-        for idx, bucket_coord in zip(self.valid_waypoint_idxs, bucket_coords):
-            self.stitch_buckets.setdefault(tuple(bucket_coord), []).append(int(idx))
-        self.stitch_buckets = {key: np.asarray(value, dtype=np.int64) for key, value in self.stitch_buckets.items()}
-
-        bucket_sizes = np.array([len(v) for v in self.stitch_buckets.values()], dtype=np.int64)
-        self.stitch_summary.update(
-            {
-                'num_waypoints': int(len(self.valid_waypoint_idxs)),
-                'num_groups': int(len(self.stitch_buckets)),
-                'group_size_min': int(np.min(bucket_sizes)) if len(bucket_sizes) else 0,
-                'group_size_mean': float(np.mean(bucket_sizes)) if len(bucket_sizes) else 0.0,
-                'group_size_max': int(np.max(bucket_sizes)) if len(bucket_sizes) else 0,
             }
         )
 
@@ -351,14 +314,9 @@ class TemporalStitchGCDataset(GCDataset):
         contact_distances = []
 
         if len(attempt_positions) > 0:
-            if self.stitch_mode == 'kmeans':
-                waypoint_infos = self.sample_waypoints_kmeans(
-                    idxs[attempt_positions], actor_goal_idxs[attempt_positions]
-                )
-            else:
-                waypoint_infos = self.sample_waypoints_bucket(
-                    idxs[attempt_positions], actor_goal_idxs[attempt_positions]
-                )
+            waypoint_infos = self.sample_waypoints_kmeans(
+                idxs[attempt_positions], actor_goal_idxs[attempt_positions]
+            )
 
             for batch_pos, waypoint_info in zip(attempt_positions, waypoint_infos):
                 if waypoint_info is None:
@@ -377,10 +335,13 @@ class TemporalStitchGCDataset(GCDataset):
                 waypoint_traj = self.traj_ids[waypoint_idx]
                 terminal_idx = int(self.terminal_locs[waypoint_traj])
                 min_goal_idx = waypoint_idx + self.stitch_future_min
-                if min_goal_idx > terminal_idx:
+                max_goal_idx = terminal_idx
+                if self.stitch_future_max is not None:
+                    max_goal_idx = min(max_goal_idx, waypoint_idx + self.stitch_future_max)
+                if min_goal_idx > max_goal_idx:
                     continue
 
-                new_goal_idx = int(np.random.randint(min_goal_idx, terminal_idx + 1))
+                new_goal_idx = int(np.random.randint(min_goal_idx, max_goal_idx + 1))
                 augmented_goal_idxs[batch_pos] = new_goal_idx
                 accepted += 1
                 candidate_counts.append(candidate_count)
@@ -454,15 +415,6 @@ class TemporalStitchGCDataset(GCDataset):
         for sample_idx, original_goal_idx in zip(sample_idxs, original_goal_idxs):
             cluster_id = int(self.stitch_cluster_labels[int(original_goal_idx)])
             candidates = self.stitch_cluster_to_waypoint_idxs.get(cluster_id)
-            results.append(self._sample_waypoint_from_candidates(sample_idx, original_goal_idx, candidates))
-        return results
-
-    def sample_waypoints_bucket(self, sample_idxs, original_goal_idxs):
-        # sample waypoint states from the same discrete XY bucket as the original goal
-        results = []
-        bucket_coords = np.floor(self.stitch_points[original_goal_idxs] / self.stitch_radius).astype(np.int64)
-        for sample_idx, original_goal_idx, bucket_coord in zip(sample_idxs, original_goal_idxs, bucket_coords):
-            candidates = self.stitch_buckets.get(tuple(bucket_coord))
             results.append(self._sample_waypoint_from_candidates(sample_idx, original_goal_idx, candidates))
         return results
 
@@ -696,6 +648,7 @@ class TemporalStitchGCDataset(GCDataset):
                 ),
                 'goal_waypoint_contact_distance': float(guard_stats.get('contact_distance', np.nan)),
                 'future_offset': int(new_goal_idx - waypoint_idx),
+                'stitch_future_max': -1 if self.stitch_future_max is None else int(self.stitch_future_max),
                 'cross_trajectory': int(sample_traj != waypoint_traj),
             }
         )

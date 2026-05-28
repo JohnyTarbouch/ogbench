@@ -10,7 +10,6 @@ def get_config():
             # for cube xyz dims
             stitch_space='xy',
             stitch_xy_dims=(19, 20, 21),
-            stitch_mode='kmeans',
             # keepthe waypoint close for relabeling
             stitch_nclusters=200,
             stitch_kmeans_random_state=0,

@@ -15,12 +15,11 @@ def get_config():
             dataset_class='TemporalStitchGCDataset',
             # Temporal stitching augmentation.
             stitch_p_aug=0.0,
-            stitch_radius=0.5,
             stitch_space='state',
             stitch_xy_dims=(0, 1),
             stitch_future_min=0,
+            stitch_future_max=-1,
             stitch_cross_traj_only=False,
-            stitch_mode='kmeans',
             stitch_nclusters=40,
             stitch_kmeans_n_init='auto',
             stitch_kmeans_random_state=None,
