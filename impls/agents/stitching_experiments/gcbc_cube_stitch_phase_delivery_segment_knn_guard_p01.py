@@ -2,7 +2,7 @@
 Delivery-aware phase stitching with guarded k-nearest-neighbor retrieval.
 """
 
-from agents.gcbc_cube_stitch_phase_delivery_segment_guard_p01 import (
+from agents.stitching_experiments.gcbc_cube_stitch_phase_delivery_segment_guard_p01 import (
     get_config as get_delivery_segment_config,
 )
 

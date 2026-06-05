@@ -1,22 +1,16 @@
 """
 GCBC with cube temporal stitching plus manipulation guards.
-
-second manip relabeling experiment. It keeps the successful parts of the cube only setup:
-
-    - policy input remains full 28D observation and full 28D goal
-    - waypoint clusters are built from cube xyz dims obs[19:22]
-    - relabeling is cross-trajectory
-
-But before accepting a waypoint w for original goal g, it checks that
-the robot-gripper phase is also compatible. This directly tests the failure
-analysis of cube-only stitching: cube position overlap alone is too loose.
+    - policy input full 28D obs
+    - waypoint clusters are built from cube xyz dims
 """
 
 from agents.gcbc_cube_stitch import get_config as get_cube_stitch_config
+from agents.stitching_experiments.gcbc_stitch_advanced import add_advanced_stitching_config
 
 
 def get_config():
     config = get_cube_stitch_config()
+    config = add_advanced_stitching_config(config)
     config.update(
         dict(
             stitch_guard_mode='cube_gripper',

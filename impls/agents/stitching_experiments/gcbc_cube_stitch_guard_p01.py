@@ -1,4 +1,4 @@
-from agents.gcbc_cube_stitch_guard import get_config as get_guard_config
+from agents.stitching_experiments.gcbc_cube_stitch_guard import get_config as get_guard_config
 
 
 def get_config():

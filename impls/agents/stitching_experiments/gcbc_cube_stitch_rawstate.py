@@ -10,7 +10,6 @@ def get_config():
     config.update(
         dict(
             stitch_space='state',
-            stitch_state_normalize=False,
         )
     )
     return config

@@ -3,10 +3,12 @@ GCBC with normalized full-state temporal stitching for cube manipulation.
 """
 
 from agents.gcbc_cube_stitch import get_config as get_cube_stitch_config
+from agents.stitching_experiments.gcbc_stitch_advanced import add_advanced_stitching_config
 
 
 def get_config():
     config = get_cube_stitch_config()
+    config = add_advanced_stitching_config(config)
     config.update(
         dict(
             stitch_space='state',

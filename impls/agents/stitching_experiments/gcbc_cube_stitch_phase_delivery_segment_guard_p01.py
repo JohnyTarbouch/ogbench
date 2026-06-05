@@ -4,7 +4,9 @@ Extends the phase segment experiment. The transport
 phase is split using the target of each offline pick-place segment.
 """
 
-from agents.gcbc_cube_stitch_phase_segment_guard_p01 import get_config as get_segment_guard_config
+from agents.stitching_experiments.gcbc_cube_stitch_phase_segment_guard_p01 import (
+    get_config as get_segment_guard_config,
+)
 
 
 def get_config():

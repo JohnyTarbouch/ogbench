@@ -3,7 +3,7 @@ The stitch is accepted only when the original future goal and the
 matched waypoint are in the same manipulation phase.
 """
 
-from agents.gcbc_cube_stitch_guard_p01 import get_config as get_guard_p01_config
+from agents.stitching_experiments.gcbc_cube_stitch_guard_p01 import get_config as get_guard_p01_config
 
 
 def get_config():

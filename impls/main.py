@@ -21,6 +21,7 @@ from utils.evaluation import evaluate
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
 from utils.stitch_datasets import TemporalStitchGCDataset
+from utils.stitch_datasets_advanced import AdvancedTemporalStitchGCDataset
 
 FLAGS = flags.FLAGS
 
@@ -120,6 +121,33 @@ def _goal_dataset_summary(name, goal_dataset):
             'max': int(np.max(lengths)),
         }
     return summary
+
+
+def _goal_sampling_summary(config):
+    base_keys = [
+        'value_p_curgoal',
+        'value_p_trajgoal',
+        'value_p_randomgoal',
+        'value_geom_sample',
+        'actor_p_curgoal',
+        'actor_p_trajgoal',
+        'actor_p_randomgoal',
+        'actor_geom_sample',
+        'gc_negative',
+        'p_aug',
+        'frame_stack',
+    ]
+    stitch_keys = sorted(
+        key for key in config.keys() 
+        if key.startswith('stitch_')
+    )
+    keys = []
+    seen = set()
+    for key in base_keys + stitch_keys:
+        if key not in seen and key in config:
+            keys.append(key)
+            seen.add(key)
+    return {key: config[key] for key in keys}
 
 
 def _env_summary(env):
@@ -235,10 +263,12 @@ def main(_):
         'GCDataset': GCDataset,
         'HGCDataset': HGCDataset,
         'TemporalStitchGCDataset': TemporalStitchGCDataset,
+        'AdvancedTemporalStitchGCDataset': AdvancedTemporalStitchGCDataset,
     }[config['dataset_class']]
     train_dataset = dataset_class(Dataset.create(**train_dataset), config)
     if val_dataset is not None:
-        val_dataset_class = GCDataset if config['dataset_class'] == 'TemporalStitchGCDataset' else dataset_class
+        stitch_dataset_classes = {'TemporalStitchGCDataset', 'AdvancedTemporalStitchGCDataset'}
+        val_dataset_class = GCDataset if config['dataset_class'] in stitch_dataset_classes else dataset_class
         val_dataset = val_dataset_class(Dataset.create(**val_dataset), config)
     _write_json(
         os.path.join(FLAGS.save_dir, 'dataset_goal_conditioned.json'),
@@ -248,37 +278,7 @@ def main(_):
             'val_dataset_class': val_dataset.__class__.__name__ if val_dataset is not None else None,
             'train_dataset': _goal_dataset_summary('train', train_dataset),
             'val_dataset': _goal_dataset_summary('val', val_dataset) if val_dataset is not None else None,
-            'goal_sampling': {
-                key: config[key]
-                for key in [
-                    'value_p_curgoal',
-                    'value_p_trajgoal',
-                    'value_p_randomgoal',
-                    'value_geom_sample',
-                    'actor_p_curgoal',
-                    'actor_p_trajgoal',
-                    'actor_p_randomgoal',
-                    'actor_geom_sample',
-                    'gc_negative',
-                    'p_aug',
-                    'frame_stack',
-                    'stitch_p_aug',
-                    'stitch_space',
-                    'stitch_xy_dims',
-                    'stitch_future_min',
-                    'stitch_future_max',
-                    'stitch_cross_traj_only',
-                    'stitch_nclusters',
-                    'stitch_kmeans_n_init',
-                    'stitch_kmeans_random_state',
-                    'stitch_debug_samples',
-                    'stitch_state_normalize',
-                    'stitch_state_normalize_eps',
-                    'stitch_state_xy_weight',
-                    'stitch_state_xy_max_dist',
-                ]
-                if key in config
-            },
+            'goal_sampling': _goal_sampling_summary(config),
             'stitching': getattr(train_dataset, 'stitch_summary', None),
         },
     )
