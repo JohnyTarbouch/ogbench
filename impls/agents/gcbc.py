@@ -164,6 +164,8 @@ def get_config():
             actor_geom_sample=False,  # Whether to use geometric sampling for future actor goals.
             gc_negative=True,  # Unused (defined for compatibility with GCDataset).
             p_aug=0.0,  # Probability of applying image augmentation.
+            aug_type='crop',  # Image augmentation type (crop or drq_shift).
+            drq_shift_pad=2,  # Padding for DrQ random-shift image augmentation.
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
         )
     )

@@ -99,6 +99,86 @@ class ImpalaEncoder(nn.Module):
 
         return out
 
+#################################################################
+# DrQ encoder
+class DrQEncoder(nn.Module):
+    """
+    DrQ-v2 RGB encoder.
+
+    DrQ-v2 style:
+        image -> conv stack -> projection -> layer norm -> tanh
+
+    Input:
+        x: uint8 RGB image (H, W, C)
+
+    Output:
+        feature vector (feature_dim)
+
+    It normalizes internally:
+        x / 255.0 - 0.5
+
+    In GCBC/GCIQL, this is usually used through GCEncoder(concat_encoder=...).
+    That means the encoder receives state and goal images concatenated on the
+    channel axis, e.g. RGB state + RGB goal -> 6 channels. Flax Conv supports
+    this directly, so the same module works for goal-conditioned image inputs.
+    """
+
+    feature_dim: int = 256
+
+    @nn.compact
+    def __call__(self, x, train=True, cond_var=None):
+        init = nn.initializers.xavier_uniform()
+
+        x = x.astype(jnp.float32) / 255.0 - 0.5
+
+        x = nn.relu(
+            nn.Conv(
+                32,
+                kernel_size=(3, 3),
+                strides=2,
+                padding='VALID',
+                kernel_init=init,
+                name='conv0',
+            )(x)
+        )
+        x = nn.relu(
+            nn.Conv(
+                32,
+                kernel_size=(3, 3),
+                strides=1,
+                padding='VALID',
+                kernel_init=init,
+                name='conv1',
+            )(x)
+        )
+        x = nn.relu(
+            nn.Conv(
+                32,
+                kernel_size=(3, 3),
+                strides=1,
+                padding='VALID',
+                kernel_init=init,
+                name='conv2',
+            )(x)
+        )
+        x = nn.relu(
+            nn.Conv(
+                32,
+                kernel_size=(3, 3),
+                strides=1,
+                padding='VALID',
+                kernel_init=init,
+                name='conv3',
+            )(x)
+        )
+
+        x = x.reshape((*x.shape[:-3], -1))
+        x = nn.Dense(self.feature_dim, kernel_init=init, name='proj')(x)
+        x = nn.LayerNorm(epsilon=1e-5, name='proj_ln')(x)
+
+        return jnp.tanh(x)
+#################################################################
+
 
 class GCEncoder(nn.Module):
     """Helper module to handle inputs to goal-conditioned networks.
@@ -141,4 +221,5 @@ encoder_modules = {
     'impala_debug': functools.partial(ImpalaEncoder, num_blocks=1, stack_sizes=(4, 4)),
     'impala_small': functools.partial(ImpalaEncoder, num_blocks=1),
     'impala_large': functools.partial(ImpalaEncoder, stack_sizes=(64, 128, 128), mlp_hidden_dims=(1024,)),
+    'drq': DrQEncoder,
 }

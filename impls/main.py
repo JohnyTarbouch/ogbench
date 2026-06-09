@@ -20,7 +20,7 @@ from utils.env_utils import make_env_and_datasets
 from utils.evaluation import evaluate
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
-from utils.stitch_datasets import TemporalStitchGCDataset
+from utils.stitch_datasets import TemporalStitchGCDataset, VisualFeatureTemporalStitchGCDataset
 from utils.stitch_datasets_advanced import AdvancedTemporalStitchGCDataset
 
 FLAGS = flags.FLAGS
@@ -263,11 +263,16 @@ def main(_):
         'GCDataset': GCDataset,
         'HGCDataset': HGCDataset,
         'TemporalStitchGCDataset': TemporalStitchGCDataset,
+        'VisualFeatureTemporalStitchGCDataset': VisualFeatureTemporalStitchGCDataset,
         'AdvancedTemporalStitchGCDataset': AdvancedTemporalStitchGCDataset,
     }[config['dataset_class']]
     train_dataset = dataset_class(Dataset.create(**train_dataset), config)
     if val_dataset is not None:
-        stitch_dataset_classes = {'TemporalStitchGCDataset', 'AdvancedTemporalStitchGCDataset'}
+        stitch_dataset_classes = {
+            'TemporalStitchGCDataset',
+            'VisualFeatureTemporalStitchGCDataset',
+            'AdvancedTemporalStitchGCDataset',
+        }
         val_dataset_class = GCDataset if config['dataset_class'] in stitch_dataset_classes else dataset_class
         val_dataset = val_dataset_class(Dataset.create(**val_dataset), config)
     _write_json(

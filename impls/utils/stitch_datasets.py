@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 
 import jax
 import numpy as np
@@ -351,3 +352,182 @@ class TemporalStitchGCDataset(GCDataset):
         records = self._stitch_debug_records
         self._stitch_debug_records = []
         return records
+
+#################################################################
+# Visual feature temporal stitching dataset
+@dataclasses.dataclass
+class VisualFeatureTemporalStitchGCDataset(TemporalStitchGCDataset):
+    """
+    Temporal stitching for visual obs using a learned feature space.
+
+    The policy still trains on image obs and image goals.
+    Only retrieval step changes:
+        encoder features phi(g_A) -> KMeans cluster -> waypoint w_B -> future g'_B
+    """
+
+    def _init_stitching(self):
+        self.stitch_p_aug = float(self._config_get('stitch_p_aug', 0.0))
+        self.stitch_space = 'feature'
+        self.stitch_feature_path = self._config_get('stitch_feature_path', '')
+        self.stitch_feature_key = self._config_get('stitch_feature_key', 'features')
+        self.stitch_feature_normalize = bool(self._config_get('stitch_feature_normalize', True))
+        self.stitch_feature_normalize_eps = float(self._config_get('stitch_feature_normalize_eps', 1e-6))
+        self.stitch_feature_dtype = self._config_get('stitch_feature_dtype', 'float32')
+        self.stitch_kmeans_fit_sample_size = int(self._config_get('stitch_kmeans_fit_sample_size', 200000))
+        self.stitch_kmeans_batch_size = int(self._config_get('stitch_kmeans_batch_size', 65536))
+        self.stitch_xy_dims = tuple(int(x) for x in self._config_get('stitch_xy_dims', (0, 1)))
+        self.stitch_future_min = int(self._config_get('stitch_future_min', 0))
+        self.stitch_cross_traj_only = bool(self._config_get('stitch_cross_traj_only', False))
+        self.stitch_nclusters = int(self._config_get('stitch_nclusters', 200))
+        self.stitch_kmeans_n_init = self._config_get('stitch_kmeans_n_init', 'auto')
+        self.stitch_kmeans_random_state = self._config_get('stitch_kmeans_random_state', None)
+        self.stitch_debug_samples = int(self._config_get('stitch_debug_samples', 0))
+
+        observations = self.dataset['observations']
+        if not isinstance(observations, np.ndarray) or observations.ndim < 3:
+            raise ValueError(
+                'VisualFeatureTemporalStitchGCDataset expects visual observations, e.g. (N, H, W, C).'
+            )
+        if self.stitch_future_min < 0:
+            raise ValueError('stitch_future_min must be non-negative.')
+        if self.stitch_nclusters <= 0:
+            raise ValueError('stitch_nclusters must be positive.')
+        if self.stitch_kmeans_batch_size <= 0:
+            raise ValueError('stitch_kmeans_batch_size must be positive.')
+
+        features = self._load_stitch_features()
+        if features.shape[0] != self.size:
+            raise ValueError(
+                f'Feature row count {features.shape[0]} does not match dataset size {self.size}. '
+                'The feature file must contain one row per training observation.'
+            )
+        if features.ndim != 2:
+            raise ValueError(f'Stitch features must be a 2D array, got shape {features.shape}.')
+        if not self.stitch_xy_dims:
+            raise ValueError('stitch_xy_dims must contain at least one feature dimension for debug metrics.')
+        if min(self.stitch_xy_dims) < 0 or max(self.stitch_xy_dims) >= features.shape[-1]:
+            raise ValueError(
+                f'stitch_xy_dims={self.stitch_xy_dims} incompatible with feature shape {features.shape}.'
+            )
+
+        self.stitch_features_raw_shape = tuple(int(x) for x in features.shape)
+        self.stitch_points = self._prepare_stitch_features(features)
+        self.stitch_observations = self.stitch_points
+
+        self.traj_ids = np.searchsorted(self.terminal_locs, np.arange(self.size))
+        self.final_state_idxs = self.terminal_locs[self.traj_ids]
+
+        if hasattr(self.dataset, 'valid_idxs'):
+            waypoint_idxs = np.asarray(self.dataset.valid_idxs, dtype=np.int64)
+        else:
+            waypoint_idxs = np.arange(self.size, dtype=np.int64)
+        waypoint_idxs = waypoint_idxs[waypoint_idxs + self.stitch_future_min <= self.final_state_idxs[waypoint_idxs]]
+        self.valid_waypoint_idxs = waypoint_idxs.astype(np.int64)
+        if len(self.valid_waypoint_idxs) == 0:
+            raise ValueError('No valid waypoint indices available for visual temporal stitching.')
+
+        self.stitch_cluster_to_waypoint_idxs: dict[int, np.ndarray] = {}
+        self.stitch_cluster_labels = None
+        self._build_kmeans_groups()
+
+        self._stitch_metric_sums: dict[str, float] = {}
+        self._stitch_metric_counts: dict[str, int] = {}
+        self._stitch_debug_records: list[dict[str, object]] = []
+        self._stitch_sample_call = 0
+
+        self.stitch_summary = {
+            'enabled': self.stitch_p_aug > 0.0,
+            'implementation': 'visual_feature_kmeans_temporal',
+            'stitch_p_aug': self.stitch_p_aug,
+            'stitch_space': self.stitch_space,
+            'stitch_feature_path': self.stitch_feature_path,
+            'stitch_feature_key': self.stitch_feature_key,
+            'stitch_feature_shape': self.stitch_features_raw_shape,
+            'stitch_feature_normalize': self.stitch_feature_normalize,
+            'stitch_feature_dtype': self.stitch_feature_dtype,
+            'stitch_xy_dims': self.stitch_xy_dims,
+            'stitch_future_min': self.stitch_future_min,
+            'stitch_cross_traj_only': self.stitch_cross_traj_only,
+            'stitch_nclusters': self.stitch_nclusters,
+            'stitch_kmeans_n_init': self.stitch_kmeans_n_init,
+            'stitch_kmeans_random_state': self.stitch_kmeans_random_state,
+            'stitch_kmeans_fit_sample_size': self.stitch_kmeans_fit_sample_size,
+            'stitch_kmeans_batch_size': self.stitch_kmeans_batch_size,
+            'stitch_debug_samples': self.stitch_debug_samples,
+        }
+        group_sizes = np.array([len(v) for v in self.stitch_cluster_to_waypoint_idxs.values()], dtype=np.int64)
+        self.stitch_summary.update(
+            {
+                'num_waypoints': int(len(self.valid_waypoint_idxs)),
+                'num_groups': int(len(self.stitch_cluster_to_waypoint_idxs)),
+                'group_size_min': int(np.min(group_sizes)) if len(group_sizes) else 0,
+                'group_size_mean': float(np.mean(group_sizes)) if len(group_sizes) else 0.0,
+                'group_size_max': int(np.max(group_sizes)) if len(group_sizes) else 0,
+                'kmeans_inertia': float(self._stitch_kmeans_inertia),
+            }
+        )
+
+    def _load_stitch_features(self):
+        feature_path = str(self.stitch_feature_path)
+        if not feature_path:
+            raise ValueError(
+                'Set --agent.stitch_feature_path=/path/to/features.npz for visual-feature stitching.'
+            )
+        if not os.path.exists(feature_path):
+            raise FileNotFoundError(f'stitch_feature_path does not exist: {feature_path}')
+
+        loaded = np.load(feature_path, mmap_mode='r')
+        if isinstance(loaded, np.lib.npyio.NpzFile):
+            with loaded:
+                if self.stitch_feature_key not in loaded.files:
+                    raise KeyError(
+                        f"Feature key {self.stitch_feature_key!r} not found in {feature_path}. "
+                        f'Available keys: {loaded.files}'
+                    )
+                features = np.asarray(loaded[self.stitch_feature_key])
+        else:
+            features = np.asarray(loaded)
+        return features
+
+    def _prepare_stitch_features(self, features):
+        dtype = np.dtype(self.stitch_feature_dtype)
+        features = np.asarray(features, dtype=dtype)
+        if not np.all(np.isfinite(features)):
+            raise ValueError('stitch features contain NaN or Inf values.')
+
+        if self.stitch_feature_normalize:
+            norms = np.linalg.norm(features, axis=1, keepdims=True)
+            features = features / np.maximum(norms, self.stitch_feature_normalize_eps)
+        return np.ascontiguousarray(features, dtype=np.float32)
+
+    def _build_kmeans_groups(self):
+        try:
+            from sklearn.cluster import KMeans
+        except ImportError as exc:
+            raise ImportError('VisualFeatureTemporalStitchGCDataset requires scikit-learn for KMeans retrieval.') from exc
+
+        kmeans = KMeans(
+            n_clusters=self.stitch_nclusters,
+            n_init=self.stitch_kmeans_n_init,
+            random_state=self.stitch_kmeans_random_state,
+        )
+
+        fit_points = self.stitch_points
+        if 0 < self.stitch_kmeans_fit_sample_size < len(self.stitch_points):
+            rng = np.random.default_rng(self.stitch_kmeans_random_state)
+            fit_idxs = rng.choice(len(self.stitch_points), size=self.stitch_kmeans_fit_sample_size, replace=False)
+            fit_points = self.stitch_points[np.sort(fit_idxs)]
+        kmeans.fit(fit_points)
+        self._stitch_kmeans_inertia = kmeans.inertia_
+
+        labels = np.empty(len(self.stitch_points), dtype=np.int64)
+        for start in range(0, len(self.stitch_points), self.stitch_kmeans_batch_size):
+            end = min(start + self.stitch_kmeans_batch_size, len(self.stitch_points))
+            labels[start:end] = kmeans.predict(self.stitch_points[start:end]).astype(np.int64)
+        self.stitch_cluster_labels = labels
+
+        for cluster_id in range(self.stitch_nclusters):
+            waypoint_idxs = self.valid_waypoint_idxs[self.stitch_cluster_labels[self.valid_waypoint_idxs] == cluster_id]
+            if len(waypoint_idxs) > 0:
+                self.stitch_cluster_to_waypoint_idxs[int(cluster_id)] = waypoint_idxs.astype(np.int64)
+#################################################################

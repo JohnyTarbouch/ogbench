@@ -87,7 +87,12 @@ def make_env_and_datasets(dataset_name, frame_stack=None):
         A tuple of the environment, training dataset, and validation dataset.
     """
     # Use compact dataset to save memory.
-    env, train_dataset, val_dataset = ogbench.make_env_and_datasets(dataset_name, compact_dataset=True)
+    # Cluster sprcifiacatopn
+    dataset_dir = os.environ.get('OGBENCH_DATASET_DIR') or os.environ.get('OGBENCH_DATA_DIR')
+    dataset_kwargs = dict(compact_dataset=True)
+    if dataset_dir:
+        dataset_kwargs['dataset_dir'] = dataset_dir
+    env, train_dataset, val_dataset = ogbench.make_env_and_datasets(dataset_name, **dataset_kwargs)
     train_dataset = Dataset.create(**train_dataset)
     val_dataset = Dataset.create(**val_dataset)
 
