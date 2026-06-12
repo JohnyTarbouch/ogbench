@@ -1,4 +1,5 @@
-"""GCBC visual cube with pure temporal stitching in a learned DrQ feature space."""
+"""
+GCBC visual cube with temporal stitching in a learned DrQ feature space."""
 
 from agents.stitching_experiments.gcbc_visual_stitch_impala import get_config as get_impala_stitch_config
 
