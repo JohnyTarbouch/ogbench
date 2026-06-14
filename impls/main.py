@@ -22,6 +22,7 @@ from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
 from utils.stitch_datasets import TemporalStitchGCDataset, VisualFeatureTemporalStitchGCDataset
 from utils.stitch_datasets_advanced import AdvancedTemporalStitchGCDataset
+from utils.visual_feature_knn_stitch_datasets import VisualFeatureLocalKnnTemporalStitchGCDataset
 
 FLAGS = flags.FLAGS
 
@@ -264,6 +265,7 @@ def main(_):
         'HGCDataset': HGCDataset,
         'TemporalStitchGCDataset': TemporalStitchGCDataset,
         'VisualFeatureTemporalStitchGCDataset': VisualFeatureTemporalStitchGCDataset,
+        'VisualFeatureLocalKnnTemporalStitchGCDataset': VisualFeatureLocalKnnTemporalStitchGCDataset,
         'AdvancedTemporalStitchGCDataset': AdvancedTemporalStitchGCDataset,
     }[config['dataset_class']]
     train_dataset = dataset_class(Dataset.create(**train_dataset), config)
@@ -271,6 +273,7 @@ def main(_):
         stitch_dataset_classes = {
             'TemporalStitchGCDataset',
             'VisualFeatureTemporalStitchGCDataset',
+            'VisualFeatureLocalKnnTemporalStitchGCDataset',
             'AdvancedTemporalStitchGCDataset',
         }
         val_dataset_class = GCDataset if config['dataset_class'] in stitch_dataset_classes else dataset_class
