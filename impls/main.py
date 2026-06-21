@@ -226,6 +226,9 @@ def _runtime_summary():
 
 
 def main(_):
+    config = FLAGS.agent
+    config['run_seed'] = FLAGS.seed
+
     # Set up logger.
     exp_name = get_exp_name(FLAGS.seed)
     setup_wandb(project='OGBench', group=FLAGS.run_group, name=exp_name)
@@ -249,7 +252,6 @@ def main(_):
     )
 
     # Set up environment and dataset.
-    config = FLAGS.agent
     env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=config['frame_stack'])
     _write_json(
         os.path.join(FLAGS.save_dir, 'dataset_raw.json'),
@@ -311,6 +313,22 @@ def main(_):
         example_batch['actions'],
         config,
     )
+    if 'representation_type' in agent.config:
+        _write_json(
+            os.path.join(FLAGS.save_dir, 'representation_transfer.json'),
+            {
+                key: agent.config.get(key)
+                for key in [
+                    'representation_type',
+                    'representation_source',
+                    'encoder_transfer_mode',
+                    'source_checkpoint',
+                    'resolved_source_checkpoint',
+                    'source_module',
+                ]
+                if key in agent.config
+            },
+        )
 
     # Restore agent.
     if FLAGS.restore_path is not None:

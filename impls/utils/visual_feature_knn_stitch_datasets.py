@@ -41,7 +41,7 @@ class VisualFeatureLocalKnnTemporalStitchGCDataset(VisualFeatureTemporalStitchGC
     def sample_waypoints_kmeans(self, goal_idxs, sample_idxs):
         waypoint_idxs = np.full(len(goal_idxs), -1, dtype=np.int64)
         candidate_counts = np.zeros(len(goal_idxs), dtype=np.float64)
-        goal_cluster_labels = self.stitch_cluster_labels[goal_idxs]
+        goal_cluster_labels = self.stitch_goal_cluster_labels[goal_idxs]
 
         for cluster_id in np.unique(goal_cluster_labels):
             row_positions = np.flatnonzero(goal_cluster_labels == cluster_id)
@@ -83,7 +83,7 @@ class VisualFeatureLocalKnnTemporalStitchGCDataset(VisualFeatureTemporalStitchGC
             candidates = candidates[positions]
 
         candidate_points = self.stitch_points[candidates]
-        goal_points = self.stitch_points[np.asarray(goal_idxs, dtype=np.int64)]
+        goal_points = self.stitch_goal_points[np.asarray(goal_idxs, dtype=np.int64)]
         candidate_norms = np.sum(candidate_points * candidate_points, axis=1)
         goal_norms = np.sum(goal_points * goal_points, axis=1)
         distances = goal_norms[:, None] + candidate_norms[None, :] - 2.0 * goal_points @ candidate_points.T

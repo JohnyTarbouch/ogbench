@@ -208,18 +208,14 @@ class TemporalStitchGCDataset(GCDataset):
             )
             self._record_stitch_metrics(
                 future_offset=(new_goal_idxs - accepted_waypoints).astype(np.float64),
-                goal_waypoint_stitch_distance=np.linalg.norm(
-                    self.stitch_points[accepted_original_goals] - self.stitch_points[accepted_waypoints],
-                    axis=-1,
+                goal_waypoint_stitch_distance=self._goal_waypoint_distances(
+                    accepted_original_goals, accepted_waypoints
                 ),
-                goal_waypoint_distance=np.linalg.norm(
-                    self.stitch_points[accepted_original_goals] - self.stitch_points[accepted_waypoints],
-                    axis=-1,
+                goal_waypoint_distance=self._goal_waypoint_distances(
+                    accepted_original_goals, accepted_waypoints
                 ),
-                goal_waypoint_xy_distance=np.linalg.norm(
-                    self.stitch_observations[accepted_original_goals][:, self.stitch_xy_dims]
-                    - self.stitch_observations[accepted_waypoints][:, self.stitch_xy_dims],
-                    axis=-1,
+                goal_waypoint_xy_distance=self._goal_waypoint_xy_distances(
+                    accepted_original_goals, accepted_waypoints
                 ),
             )
 
@@ -302,16 +298,22 @@ class TemporalStitchGCDataset(GCDataset):
                 'cross_trajectory': bool(self.traj_ids[sample_idx] != self.traj_ids[waypoint_idx]),
                 'stitch_space': self.stitch_space,
                 'goal_waypoint_stitch_distance': float(
-                    np.linalg.norm(self.stitch_points[original_goal_idx] - self.stitch_points[waypoint_idx])
+                    self._goal_waypoint_distances(
+                        np.asarray([original_goal_idx]),
+                        np.asarray([waypoint_idx]),
+                    )[0]
                 ),
                 'goal_waypoint_distance': float(
-                    np.linalg.norm(self.stitch_points[original_goal_idx] - self.stitch_points[waypoint_idx])
+                    self._goal_waypoint_distances(
+                        np.asarray([original_goal_idx]),
+                        np.asarray([waypoint_idx]),
+                    )[0]
                 ),
                 'goal_waypoint_xy_distance': float(
-                    np.linalg.norm(
-                        self.stitch_observations[original_goal_idx, self.stitch_xy_dims]
-                        - self.stitch_observations[waypoint_idx, self.stitch_xy_dims]
-                    )
+                    self._goal_waypoint_xy_distances(
+                        np.asarray([original_goal_idx]),
+                        np.asarray([waypoint_idx]),
+                    )[0]
                 ),
             }
             for dim_i, dim in enumerate(self.stitch_xy_dims[:3]):
@@ -321,6 +323,19 @@ class TemporalStitchGCDataset(GCDataset):
                 record[f'new_goal_xy_{dim_i}'] = float(self.stitch_observations[new_goal_idx, dim])
             self._stitch_debug_records.append(record)
         self._stitch_sample_call += 1
+
+    def _goal_waypoint_distances(self, goal_idxs, waypoint_idxs):
+        return np.linalg.norm(
+            self.stitch_points[goal_idxs] - self.stitch_points[waypoint_idxs],
+            axis=-1,
+        )
+
+    def _goal_waypoint_xy_distances(self, goal_idxs, waypoint_idxs):
+        return np.linalg.norm(
+            self.stitch_observations[goal_idxs][:, self.stitch_xy_dims]
+            - self.stitch_observations[waypoint_idxs][:, self.stitch_xy_dims],
+            axis=-1,
+        )
 
     def _record_stitch_metrics(self, **metrics):
         for name, values in metrics.items():
@@ -368,8 +383,25 @@ class VisualFeatureTemporalStitchGCDataset(TemporalStitchGCDataset):
     def _init_stitching(self):
         self.stitch_p_aug = float(self._config_get('stitch_p_aug', 0.0))
         self.stitch_space = 'feature'
-        self.stitch_feature_path = self._config_get('stitch_feature_path', '')
-        self.stitch_feature_key = self._config_get('stitch_feature_key', 'features')
+        self.stitch_feature_path = self._format_seed_path(
+            self._config_get('stitch_feature_path', '')
+        )
+        self.stitch_state_feature_path = self._format_seed_path(
+            self._config_get('stitch_state_feature_path', self.stitch_feature_path)
+        )
+        self.stitch_goal_feature_path = self._format_seed_path(
+            self._config_get('stitch_goal_feature_path', self.stitch_state_feature_path)
+        )
+        self.stitch_feature_key = self._config_get(
+            'stitch_feature_key', 
+            'features'
+        )
+        self.stitch_state_feature_key = self._config_get(
+            'stitch_state_feature_key', self.stitch_feature_key
+        )
+        self.stitch_goal_feature_key = self._config_get(
+            'stitch_goal_feature_key', self.stitch_state_feature_key
+        )
         self.stitch_feature_normalize = bool(self._config_get('stitch_feature_normalize', True))
         self.stitch_feature_normalize_eps = float(self._config_get('stitch_feature_normalize_eps', 1e-6))
         self.stitch_feature_dtype = self._config_get('stitch_feature_dtype', 'float32')
@@ -395,23 +427,42 @@ class VisualFeatureTemporalStitchGCDataset(TemporalStitchGCDataset):
         if self.stitch_kmeans_batch_size <= 0:
             raise ValueError('stitch_kmeans_batch_size must be positive.')
 
-        features = self._load_stitch_features()
-        if features.shape[0] != self.size:
+        state_features = self._load_stitch_features(
+            self.stitch_state_feature_path,
+            self.stitch_state_feature_key,
+        )
+        goal_features = self._load_stitch_features(
+            self.stitch_goal_feature_path,
+            self.stitch_goal_feature_key,
+        )
+        if state_features.shape[0] != self.size or goal_features.shape[0] != self.size:
             raise ValueError(
-                f'Feature row count {features.shape[0]} does not match dataset size {self.size}. '
-                'The feature file must contain one row per training observation.'
+                f'Feature row counts state={state_features.shape[0]}, goal={goal_features.shape[0]} '
+                f'do not match dataset size {self.size}. Each feature file must contain '
+                'one row per training observation.'
             )
-        if features.ndim != 2:
-            raise ValueError(f'Stitch features must be a 2D array, got shape {features.shape}.')
+        if state_features.ndim != 2 or goal_features.ndim != 2:
+            raise ValueError(
+                'Stitch features must be 2D arrays, got '
+                f'state={state_features.shape}, goal={goal_features.shape}.'
+            )
+        if state_features.shape[1] != goal_features.shape[1]:
+            raise ValueError(
+                f'State and goal feature dimensions differ: '
+                f'{state_features.shape[1]} != {goal_features.shape[1]}.'
+            )
         if not self.stitch_xy_dims:
             raise ValueError('stitch_xy_dims must contain at least one feature dimension for debug metrics.')
-        if min(self.stitch_xy_dims) < 0 or max(self.stitch_xy_dims) >= features.shape[-1]:
+        if min(self.stitch_xy_dims) < 0 or max(self.stitch_xy_dims) >= state_features.shape[-1]:
             raise ValueError(
-                f'stitch_xy_dims={self.stitch_xy_dims} incompatible with feature shape {features.shape}.'
+                f'stitch_xy_dims={self.stitch_xy_dims} incompatible with '
+                f'feature shape {state_features.shape}.'
             )
 
-        self.stitch_features_raw_shape = tuple(int(x) for x in features.shape)
-        self.stitch_points = self._prepare_stitch_features(features)
+        self.stitch_features_raw_shape = tuple(int(x) for x in state_features.shape)
+        self.stitch_goal_features_raw_shape = tuple(int(x) for x in goal_features.shape)
+        self.stitch_points = self._prepare_stitch_features(state_features)
+        self.stitch_goal_points = self._prepare_stitch_features(goal_features)
         self.stitch_observations = self.stitch_points
 
         self.traj_ids = np.searchsorted(self.terminal_locs, np.arange(self.size))
@@ -443,6 +494,19 @@ class VisualFeatureTemporalStitchGCDataset(TemporalStitchGCDataset):
             'stitch_feature_path': self.stitch_feature_path,
             'stitch_feature_key': self.stitch_feature_key,
             'stitch_feature_shape': self.stitch_features_raw_shape,
+            'stitch_state_feature_path': self.stitch_state_feature_path,
+            'stitch_goal_feature_path': self.stitch_goal_feature_path,
+            'stitch_state_feature_key': self.stitch_state_feature_key,
+            'stitch_goal_feature_key': self.stitch_goal_feature_key,
+            'stitch_goal_feature_shape': self.stitch_goal_features_raw_shape,
+            'stitch_retrieval_direction': (
+                'goal_encoder_to_state_encoder'
+                if (
+                    self.stitch_state_feature_path != self.stitch_goal_feature_path
+                    or self.stitch_state_feature_key != self.stitch_goal_feature_key
+                )
+                else 'shared_feature_space'
+            ),
             'stitch_feature_normalize': self.stitch_feature_normalize,
             'stitch_feature_dtype': self.stitch_feature_dtype,
             'stitch_xy_dims': self.stitch_xy_dims,
@@ -467,11 +531,23 @@ class VisualFeatureTemporalStitchGCDataset(TemporalStitchGCDataset):
             }
         )
 
-    def _load_stitch_features(self):
-        feature_path = str(self.stitch_feature_path)
+    def _format_seed_path(self, path):
+        path = str(path)
+        if not path:
+            return path
+        seed = int(self._config_get('run_seed', 0))
+        path = path.replace('%SEED3%', f'{seed:03d}')
+        path = path.replace('%SEED%', str(seed))
+        if '{seed' in path:
+            path = path.format(seed=seed)
+        return path
+
+    def _load_stitch_features(self, feature_path, feature_key):
+        feature_path = str(feature_path)
         if not feature_path:
             raise ValueError(
-                'Set --agent.stitch_feature_path=/path/to/features.npz for visual-feature stitching.'
+                'Set stitch_state_feature_path/stitch_goal_feature_path (or the '
+                'legacy stitch_feature_path) for visual-feature stitching.'
             )
         if not os.path.exists(feature_path):
             raise FileNotFoundError(f'stitch_feature_path does not exist: {feature_path}')
@@ -479,12 +555,12 @@ class VisualFeatureTemporalStitchGCDataset(TemporalStitchGCDataset):
         loaded = np.load(feature_path, mmap_mode='r')
         if isinstance(loaded, np.lib.npyio.NpzFile):
             with loaded:
-                if self.stitch_feature_key not in loaded.files:
+                if feature_key not in loaded.files:
                     raise KeyError(
-                        f"Feature key {self.stitch_feature_key!r} not found in {feature_path}. "
+                        f"Feature key {feature_key!r} not found in {feature_path}. "
                         f'Available keys: {loaded.files}'
                     )
-                features = np.asarray(loaded[self.stitch_feature_key])
+                features = np.asarray(loaded[feature_key])
         else:
             features = np.asarray(loaded)
         return features
@@ -521,13 +597,42 @@ class VisualFeatureTemporalStitchGCDataset(TemporalStitchGCDataset):
         self._stitch_kmeans_inertia = kmeans.inertia_
 
         labels = np.empty(len(self.stitch_points), dtype=np.int64)
+        goal_labels = np.empty(len(self.stitch_goal_points), dtype=np.int64)
         for start in range(0, len(self.stitch_points), self.stitch_kmeans_batch_size):
             end = min(start + self.stitch_kmeans_batch_size, len(self.stitch_points))
             labels[start:end] = kmeans.predict(self.stitch_points[start:end]).astype(np.int64)
+            goal_labels[start:end] = kmeans.predict(self.stitch_goal_points[start:end]).astype(np.int64)
         self.stitch_cluster_labels = labels
+        self.stitch_goal_cluster_labels = goal_labels
 
         for cluster_id in range(self.stitch_nclusters):
             waypoint_idxs = self.valid_waypoint_idxs[self.stitch_cluster_labels[self.valid_waypoint_idxs] == cluster_id]
             if len(waypoint_idxs) > 0:
                 self.stitch_cluster_to_waypoint_idxs[int(cluster_id)] = waypoint_idxs.astype(np.int64)
+
+    def sample_waypoints_kmeans(self, goal_idxs, sample_idxs):
+        waypoint_idxs = np.full(len(goal_idxs), -1, dtype=np.int64)
+        candidate_counts = np.zeros(len(goal_idxs), dtype=np.float64)
+        goal_cluster_labels = self.stitch_goal_cluster_labels[goal_idxs]
+        for i, (sample_idx, cluster_id) in enumerate(zip(sample_idxs, goal_cluster_labels)):
+            candidates = self.stitch_cluster_to_waypoint_idxs.get(int(cluster_id))
+            if candidates is None or len(candidates) == 0:
+                continue
+            waypoint_idx, candidate_count = self._sample_waypoint_from_candidates(candidates, sample_idx)
+            waypoint_idxs[i] = waypoint_idx
+            candidate_counts[i] = candidate_count
+        return waypoint_idxs, candidate_counts
+
+    def _goal_waypoint_distances(self, goal_idxs, waypoint_idxs):
+        return np.linalg.norm(
+            self.stitch_goal_points[goal_idxs] - self.stitch_points[waypoint_idxs],
+            axis=-1,
+        )
+
+    def _goal_waypoint_xy_distances(self, goal_idxs, waypoint_idxs):
+        return np.linalg.norm(
+            self.stitch_goal_points[goal_idxs][:, self.stitch_xy_dims]
+            - self.stitch_points[waypoint_idxs][:, self.stitch_xy_dims],
+            axis=-1,
+        )
 #################################################################
