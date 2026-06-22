@@ -2,6 +2,7 @@ import functools
 import glob
 import os
 import pickle
+import tempfile
 from typing import Any, Dict, Mapping, Sequence
 
 import flax
@@ -11,6 +12,7 @@ import jax.numpy as jnp
 import optax
 
 nonpytree_field = functools.partial(flax.struct.field, pytree_node=False)
+CHECKPOINT_COPY_CHUNK_SIZE = 16 * 1024 * 1024
 
 
 class ModuleDict(nn.Module):
@@ -168,12 +170,38 @@ def save_agent(agent, save_dir, epoch):
         epoch: Epoch number.
     """
 
-    save_dict = dict(
-        agent=flax.serialization.to_state_dict(agent),
-    )
+    save_dict = dict(agent=jax.device_get(flax.serialization.to_state_dict(agent)))
     save_path = os.path.join(save_dir, f'params_{epoch}.pkl')
-    with open(save_path, 'wb') as f:
-        pickle.dump(save_dict, f)
+    temp_path = f'{save_path}.tmp'
+    staging_fd, staging_path = tempfile.mkstemp(
+        prefix=f'ogbench_params_{epoch}_',
+        suffix='.pkl',
+        dir='/tmp',
+    )
+    try:
+        with os.fdopen(staging_fd, 'wb') as staging_file:
+            pickle.dump(save_dict, staging_file, protocol=pickle.HIGHEST_PROTOCOL)
+            staging_file.flush()
+            os.fsync(staging_file.fileno())
+
+        with open(staging_path, 'rb') as source, open(temp_path, 'wb', buffering=0) as destination:
+            while True:
+                chunk = source.read(CHECKPOINT_COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                destination.write(chunk)
+            os.fsync(destination.fileno())
+        if os.path.getsize(temp_path) != os.path.getsize(staging_path):
+            raise OSError(
+                f'Checkpoint copy size mismatch: source={os.path.getsize(staging_path)}, '
+                f'destination={os.path.getsize(temp_path)}'
+            )
+        os.replace(temp_path, save_path)
+    finally:
+        if os.path.exists(staging_path):
+            os.remove(staging_path)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
     print(f'Saved to {save_path}')
 
