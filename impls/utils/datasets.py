@@ -1,11 +1,13 @@
 import dataclasses
 from functools import partial
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional, Union
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.core.frozen_dict import FrozenDict
+from utils.language import load_language_cache
 
 
 def get_size(data):
@@ -271,6 +273,22 @@ class GCDataset:
             batch['observations'] = self.get_observations(idxs)
             batch['next_observations'] = self.get_observations(idxs + 1)
 
+        value_goal_idxs, actor_goal_idxs = self.sample_goal_indices(idxs)
+
+        batch['value_goals'] = self.get_observations(value_goal_idxs)
+        batch['actor_goals'] = self.get_observations(actor_goal_idxs)
+        successes = (idxs == value_goal_idxs).astype(float)
+        batch['masks'] = 1.0 - successes
+        batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
+
+        if self.config['p_aug'] is not None and not evaluation:
+            if np.random.rand() < self.config['p_aug']:
+                self.augment(batch, ['observations', 'next_observations', 'value_goals', 'actor_goals'])
+        # print("Batch sampled with indices:", idxs)
+        return batch
+
+    def sample_goal_indices(self, idxs):
+        """Sample value and actor goal indices using the standard OGBench order."""
         value_goal_idxs = self.sample_goals(
             idxs,
             self.config['value_p_curgoal'],
@@ -285,18 +303,7 @@ class GCDataset:
             self.config['actor_p_randomgoal'],
             self.config['actor_geom_sample'],
         )
-
-        batch['value_goals'] = self.get_observations(value_goal_idxs)
-        batch['actor_goals'] = self.get_observations(actor_goal_idxs)
-        successes = (idxs == value_goal_idxs).astype(float)
-        batch['masks'] = 1.0 - successes
-        batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
-
-        if self.config['p_aug'] is not None and not evaluation:
-            if np.random.rand() < self.config['p_aug']:
-                self.augment(batch, ['observations', 'next_observations', 'value_goals', 'actor_goals'])
-
-        return batch
+        return value_goal_idxs, actor_goal_idxs
 
     def sample_goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample):
         """Sample goals for the given indices."""
@@ -363,6 +370,313 @@ class GCDataset:
             cur_idxs = np.maximum(idxs - i, initial_state_idxs)
             rets.append(jax.tree_util.tree_map(lambda arr: arr[cur_idxs], self.dataset['observations']))
         return jax.tree_util.tree_map(lambda *args: np.concatenate(args, axis=-1), *rets)
+
+
+def _initialize_language_conditioning(owner):
+    # Load the language embedding 
+    # set up the language conditioning
+    cache = load_language_cache(
+        owner.config['language_embedding_path'],
+        int(owner.config['num_language_tasks']),
+        int(owner.config['language_embedding_dim']),
+    )
+    train_variant = str(owner.config.get('language_train_variant', 'canonical'))
+    if train_variant not in {'canonical', 'train'}:
+        raise ValueError("language_train_variant must be 'canonical' or 'train'.")
+    owner.language_cache = cache
+    owner.language_train_variant = train_variant
+    owner._language_task_counts = np.zeros(int(owner.config['num_language_tasks']), dtype=np.int64)
+    owner._language_variant_counts = np.zeros(
+        1 if train_variant == 'canonical' else cache['train_embeddings'].shape[1],
+        dtype=np.int64,
+    )
+    owner.language_summary = {
+        'path': cache['path'],
+        'model_name': cache['model_name'],
+        'normalized': cache['normalized'],
+        'embedding_dim': int(cache['canonical_embeddings'].shape[-1]),
+        'train_variant': train_variant,
+        'train_variants_per_task': int(cache['train_embeddings'].shape[1]),
+        'heldout_variants_per_task': int(cache['heldout_embeddings'].shape[1]),
+    }
+
+
+def _attach_language_condition(owner, batch, task_ids, evaluation):
+    task_ids = np.asarray(task_ids, dtype=np.int64)
+    num_tasks = int(owner.config['num_language_tasks'])
+    if np.any(task_ids < 1) or np.any(task_ids > num_tasks):
+        raise ValueError(f'Language task IDs must be in [1, {num_tasks}].')
+    task_rows = task_ids - 1
+    if evaluation or owner.language_train_variant == 'canonical':
+        embeddings = owner.language_cache['canonical_embeddings'][task_rows]
+        variant_idxs = np.zeros(len(task_rows), dtype=np.int32)
+    else:
+        num_variants = owner.language_cache['train_embeddings'].shape[1]
+        variant_idxs = np.random.randint(num_variants, size=len(task_rows)).astype(np.int32)
+        embeddings = owner.language_cache['train_embeddings'][task_rows, variant_idxs]
+    if not evaluation:
+        np.add.at(owner._language_task_counts, task_rows, 1)
+        np.add.at(owner._language_variant_counts, variant_idxs, 1)
+    batch['language_embeddings'] = np.asarray(embeddings, dtype=np.float32)
+    return batch
+
+
+def _get_and_reset_language_diagnostics(owner):
+    total = int(np.sum(owner._language_task_counts))
+    metrics = {'data/language_samples': float(total)}
+    if total:
+        for task_idx, count in enumerate(owner._language_task_counts, start=1):
+            metrics[f'data/task_{task_idx}_fraction'] = float(count / total)
+        variant_total = int(np.sum(owner._language_variant_counts))
+        variant_prefix = 'canonical' if owner.language_train_variant == 'canonical' else 'train'
+        for variant_idx, count in enumerate(owner._language_variant_counts):
+            metrics[f'data/{variant_prefix}_variant_{variant_idx}_fraction'] = float(count / variant_total)
+    owner._language_task_counts.fill(0)
+    owner._language_variant_counts.fill(0)
+    return metrics
+
+
+@dataclasses.dataclass
+class _AtomicSegmentDataset(GCDataset):
+    """Sample transitions from a validated atomic Cube segment manifest.
+
+    Manifest positions form this dataset's public index space. Each position
+    maps to one transition in the original compact OGBench dataset and one
+    language-task label. Keeping the original dataset intact lets frame
+    stacking use the true episode boundaries without copying image observations.
+    """
+
+    # Only a small manifest-selected subset is sampled. Building stacks for
+    # every raw frame would need tens of gigabytes without changing a batch.
+    preprocess_frame_stack: bool = False
+    manifest_path: Optional[Union[str, Path]] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.raw_size = self.dataset.size
+        if self.manifest_path is None:
+            raise ValueError('AtomicLanguageDataset requires manifest_path.')
+
+        manifest_path = Path(self.manifest_path).expanduser().resolve()
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f'Atomic segment manifest not found: {manifest_path}')
+
+        required = {'transition_indices', 'transition_segment_ids', 'task_id'}
+        with np.load(manifest_path, allow_pickle=False) as manifest:
+            missing = required.difference(manifest.files)
+            if missing:
+                raise ValueError(f'Atomic segment manifest is missing keys: {sorted(missing)}')
+            transition_indices = np.asarray(manifest['transition_indices'], dtype=np.int64)
+            transition_segment_ids = np.asarray(manifest['transition_segment_ids'], dtype=np.int64)
+            segment_task_ids = np.asarray(manifest['task_id'], dtype=np.int64)
+            segment_episode_ids = (
+                np.asarray(manifest['episode_id'], dtype=np.int64)
+                if 'episode_id' in manifest.files
+                else None
+            )
+
+        if transition_indices.ndim != 1 or transition_segment_ids.ndim != 1:
+            raise ValueError('Atomic manifest transition arrays must be one-dimensional.')
+        if len(transition_indices) == 0:
+            raise ValueError('Atomic manifest contains no language-labelled transitions.')
+        if len(transition_indices) != len(transition_segment_ids):
+            raise ValueError('transition_indices and transition_segment_ids must have equal length.')
+        if np.any(transition_segment_ids < 0) or np.any(transition_segment_ids >= len(segment_task_ids)):
+            raise ValueError('Atomic manifest contains an out-of-range transition_segment_id.')
+        if np.any(transition_indices < 0) or np.any(transition_indices >= self.raw_size - 1):
+            raise ValueError(
+                f'Atomic transition indices must be in [0, {self.raw_size - 2}] so next observations exist.'
+            )
+        if len(np.unique(transition_indices)) != len(transition_indices):
+            raise ValueError('Atomic manifest contains duplicate transition indices.')
+
+        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, transition_indices)]
+        if np.any(transition_indices >= final_state_idxs):
+            raise ValueError('Atomic manifest includes a terminal transition without an in-episode successor.')
+
+        task_ids = segment_task_ids[transition_segment_ids]
+        num_language_tasks = int(self.config['num_language_tasks'])
+        if np.any(task_ids < 1) or np.any(task_ids > num_language_tasks):
+            raise ValueError(f'Atomic task IDs must be in [1, {num_language_tasks}].')
+
+        self.manifest_path = manifest_path
+        self.transition_indices = transition_indices
+        self.transition_segment_ids = transition_segment_ids.astype(np.int32)
+        self.transition_task_ids = task_ids.astype(np.int32)
+        self.size = len(transition_indices)
+
+        task_values, task_counts = np.unique(self.transition_task_ids, return_counts=True)
+        used_segment_ids = np.unique(self.transition_segment_ids)
+        used_episode_ids = (
+            np.unique(segment_episode_ids[used_segment_ids])
+            if segment_episode_ids is not None
+            else np.empty(0, dtype=np.int64)
+        )
+        self.manifest_summary = {
+            'path': str(manifest_path),
+            'raw_dataset_size': int(self.raw_size),
+            'num_transitions': int(self.size),
+            'num_segments': int(len(used_segment_ids)),
+            'num_episodes': int(len(used_episode_ids)),
+            'transitions_per_task': {
+                str(int(task_id)): int(count)
+                for task_id, count in zip(task_values, task_counts)
+            },
+        }
+
+    def _sample_atomic(self, batch_size, idxs=None, evaluation=False):
+        """Sample transitions and their internal language-task labels."""
+        if idxs is None:
+            idxs = np.random.randint(self.size, size=batch_size)
+        idxs = np.asarray(idxs, dtype=np.int64)
+        if np.any(idxs < 0) or np.any(idxs >= self.size):
+            raise IndexError(f'Atomic dataset positions must be in [0, {self.size - 1}].')
+
+        raw_idxs = self.transition_indices[idxs]
+        batch = self.dataset.sample(len(idxs), raw_idxs)
+        if self.config['frame_stack'] is not None:
+            batch['observations'] = self.get_observations(raw_idxs)
+            batch['next_observations'] = self.get_observations(raw_idxs + 1)
+
+        if self.config['p_aug'] is not None and not evaluation:
+            if np.random.rand() < self.config['p_aug']:
+                self.augment(batch, ['observations', 'next_observations'])
+
+        return batch, self.transition_task_ids[idxs]
+
+
+@dataclasses.dataclass
+class AtomicLanguageDataset(_AtomicSegmentDataset):
+    """Atomic Cube transitions conditioned on frozen language embeddings."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        mode = str(self.config.get('language_dataset_mode', 'atomic_movement'))
+        if mode != 'atomic_movement':
+            raise ValueError("AtomicLanguageDataset requires language_dataset_mode='atomic_movement'.")
+        _initialize_language_conditioning(self)
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        batch, task_ids = self._sample_atomic(batch_size, idxs=idxs, evaluation=evaluation)
+        return _attach_language_condition(self, batch, task_ids, evaluation)
+
+    def get_and_reset_diagnostics(self):
+        """Report the task and paraphrase mixture actually seen by training."""
+        return _get_and_reset_language_diagnostics(self)
+
+
+@dataclasses.dataclass
+class FutureGoalLanguageDataset(GCDataset):
+    """Standard OGBench future-goal sampling with goal images replaced by language.
+
+    This class samples current transitions and future indices exactly through
+    ``GCDataset.sample_goal_indices``. A precomputed per-state lookup maps each
+    sampled future index to a destination-language task. Unlike
+    ``AtomicLanguageDataset``, it does not use movement manifests.
+    """
+
+    preprocess_frame_stack: bool = False
+    labels_path: Optional[Union[str, Path]] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        mode = str(self.config.get('language_dataset_mode', 'standard_future_goal'))
+        if mode != 'standard_future_goal':
+            raise ValueError(
+                "FutureGoalLanguageDataset requires language_dataset_mode='standard_future_goal'."
+            )
+        if self.labels_path is None:
+            raise ValueError('FutureGoalLanguageDataset requires labels_path.')
+
+        labels_path = Path(self.labels_path).expanduser().resolve()
+        if not labels_path.is_file():
+            raise FileNotFoundError(f'Future-goal language labels not found: {labels_path}')
+        with np.load(labels_path, allow_pickle=False) as labels:
+            required = {'state_task_ids', 'task_ids', 'source_num_states'}
+            missing = required.difference(labels.files)
+            if missing:
+                raise ValueError(f'Future-goal language labels are missing keys: {sorted(missing)}')
+            state_task_ids = np.asarray(labels['state_task_ids'], dtype=np.int32)
+            task_ids = np.asarray(labels['task_ids'], dtype=np.int32)
+            source_num_states = int(labels['source_num_states'])
+            outside_grid_states = int(labels['num_outside_grid_states']) if 'num_outside_grid_states' in labels else 0
+
+        num_tasks = int(self.config['num_language_tasks'])
+        expected_task_ids = np.arange(1, num_tasks + 1, dtype=np.int32)
+        if not np.array_equal(task_ids, expected_task_ids):
+            raise ValueError(f'Future-goal label task IDs must equal {expected_task_ids.tolist()}.')
+        if state_task_ids.shape != (self.dataset.size,):
+            raise ValueError(
+                f'Future-goal state_task_ids has shape {state_task_ids.shape}; '
+                f'expected {(self.dataset.size,)}.'
+            )
+        if source_num_states != self.dataset.size:
+            raise ValueError(
+                f'Future-goal labels were built for {source_num_states} states, '
+                f'but the dataset has {self.dataset.size}.'
+            )
+        if np.any(state_task_ids < 1) or np.any(state_task_ids > num_tasks):
+            raise ValueError(f'Future-goal state task IDs must be in [1, {num_tasks}].')
+
+        self.labels_path = labels_path
+        self.state_task_ids = state_task_ids
+        task_values, task_counts = np.unique(state_task_ids, return_counts=True)
+        self.future_label_summary = {
+            'path': str(labels_path),
+            'raw_dataset_size': int(self.dataset.size),
+            'num_outside_grid_states': outside_grid_states,
+            'states_per_task': {
+                str(int(task_id)): int(count)
+                for task_id, count in zip(task_values, task_counts)
+            },
+        }
+        self._future_goal_count = 0
+        self._future_goal_offset_sum = 0
+        self._future_goal_same_state_count = 0
+        self._future_goal_same_cell_count = 0
+        _initialize_language_conditioning(self)
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        if idxs is None:
+            idxs = self.dataset.get_random_idxs(batch_size)
+        idxs = np.asarray(idxs, dtype=np.int64)
+        batch = self.dataset.sample(len(idxs), idxs)
+        if self.config['frame_stack'] is not None:
+            batch['observations'] = self.get_observations(idxs)
+            batch['next_observations'] = self.get_observations(idxs + 1)
+
+        _, actor_goal_idxs = self.sample_goal_indices(idxs)
+        future_task_ids = self.state_task_ids[actor_goal_idxs]
+        _attach_language_condition(self, batch, future_task_ids, evaluation)
+
+        if not evaluation:
+            offsets = actor_goal_idxs - idxs
+            self._future_goal_count += len(idxs)
+            self._future_goal_offset_sum += int(np.sum(offsets))
+            self._future_goal_same_state_count += int(np.sum(offsets == 0))
+            self._future_goal_same_cell_count += int(
+                np.sum(future_task_ids == self.state_task_ids[idxs])
+            )
+            if self.config['p_aug'] is not None and np.random.rand() < self.config['p_aug']:
+                self.augment(batch, ['observations', 'next_observations'])
+        return batch
+
+    def get_and_reset_diagnostics(self):
+        metrics = _get_and_reset_language_diagnostics(self)
+        if self._future_goal_count:
+            count = self._future_goal_count
+            metrics.update(
+                {
+                    'data/future_goal_offset_mean': self._future_goal_offset_sum / count,
+                    'data/future_goal_same_state_fraction': self._future_goal_same_state_count / count,
+                    'data/future_goal_same_cell_fraction': self._future_goal_same_cell_count / count,
+                }
+            )
+        self._future_goal_count = 0
+        self._future_goal_offset_sum = 0
+        self._future_goal_same_state_count = 0
+        self._future_goal_same_cell_count = 0
+        return metrics
 
 
 @dataclasses.dataclass

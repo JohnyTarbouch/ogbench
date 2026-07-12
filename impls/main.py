@@ -15,9 +15,9 @@ import wandb
 from absl import app, flags
 from agents import agents
 from ml_collections import config_flags
-from utils.datasets import Dataset, GCDataset, HGCDataset
+from utils.datasets import AtomicLanguageDataset, Dataset, FutureGoalLanguageDataset, GCDataset, HGCDataset
 from utils.env_utils import make_env_and_datasets
-from utils.evaluation import evaluate
+from utils.evaluation import EVAL_DIAGNOSTIC_METRICS, evaluate
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
 from utils.stitch_datasets import TemporalStitchGCDataset, VisualFeatureTemporalStitchGCDataset
@@ -45,6 +45,7 @@ flags.DEFINE_float('eval_gaussian', None, 'Action Gaussian noise for evaluation.
 flags.DEFINE_integer('video_episodes', 1, 'Number of video episodes for each task.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
+flags.DEFINE_bool('eval_diagnostics', False, 'Whether to save compact rollout diagnostics.')
 
 config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
@@ -114,6 +115,14 @@ def _goal_dataset_summary(name, goal_dataset):
         'size': int(goal_dataset.size),
         'num_trajectories': int(len(goal_dataset.terminal_locs)),
     }
+    if hasattr(goal_dataset, 'manifest_summary'):
+        # print(f"Language data summary for {name}: {goal_dataset.manifest_summary}")
+        summary['atomic_manifest'] = goal_dataset.manifest_summary
+    if hasattr(goal_dataset, 'future_label_summary'):
+        # print(f"Future goal language label summary for {name}: {goal_dataset.future_label_summary}")
+        summary['future_goal_language_labels'] = goal_dataset.future_label_summary
+    if hasattr(goal_dataset, 'language_summary'):
+        summary['language'] = goal_dataset.language_summary
     if len(goal_dataset.terminal_locs) > 0:
         lengths = goal_dataset.terminal_locs - goal_dataset.initial_locs + 1
         summary['trajectory_length'] = {
@@ -137,6 +146,17 @@ def _goal_sampling_summary(config):
         'gc_negative',
         'p_aug',
         'frame_stack',
+        'policy_conditioning',
+        'language_dataset_mode',
+        'num_language_tasks',
+        'atomic_train_manifest_path',
+        'atomic_val_manifest_path',
+        'future_language_train_labels_path',
+        'future_language_val_labels_path',
+        'language_embedding_path',
+        'language_embedding_dim',
+        'language_train_variant',
+        'language_eval_variants',
     ]
     stitch_keys = sorted(
         key for key in config.keys() 
@@ -263,6 +283,8 @@ def main(_):
     )
 
     dataset_class = {
+        'AtomicLanguageDataset': AtomicLanguageDataset,
+        'FutureGoalLanguageDataset': FutureGoalLanguageDataset,
         'GCDataset': GCDataset,
         'HGCDataset': HGCDataset,
         'TemporalStitchGCDataset': TemporalStitchGCDataset,
@@ -270,7 +292,13 @@ def main(_):
         'VisualFeatureLocalKnnTemporalStitchGCDataset': VisualFeatureLocalKnnTemporalStitchGCDataset,
         'AdvancedTemporalStitchGCDataset': AdvancedTemporalStitchGCDataset,
     }[config['dataset_class']]
-    train_dataset = dataset_class(Dataset.create(**train_dataset), config)
+    # set up training dataset with arguments
+    train_dataset_kwargs = {}
+    if dataset_class is AtomicLanguageDataset:
+        train_dataset_kwargs['manifest_path'] = config['atomic_train_manifest_path']
+    elif dataset_class is FutureGoalLanguageDataset:
+        train_dataset_kwargs['labels_path'] = config['future_language_train_labels_path']
+    train_dataset = dataset_class(Dataset.create(**train_dataset), config, **train_dataset_kwargs)
     if val_dataset is not None:
         stitch_dataset_classes = {
             'TemporalStitchGCDataset',
@@ -279,7 +307,13 @@ def main(_):
             'AdvancedTemporalStitchGCDataset',
         }
         val_dataset_class = GCDataset if config['dataset_class'] in stitch_dataset_classes else dataset_class
-        val_dataset = val_dataset_class(Dataset.create(**val_dataset), config)
+        # set up validation dataset with arguments
+        val_dataset_kwargs = {}
+        if val_dataset_class is AtomicLanguageDataset:
+            val_dataset_kwargs['manifest_path'] = config['atomic_val_manifest_path']
+        elif val_dataset_class is FutureGoalLanguageDataset:
+            val_dataset_kwargs['labels_path'] = config['future_language_val_labels_path']
+        val_dataset = val_dataset_class(Dataset.create(**val_dataset), config, **val_dataset_kwargs)
     _write_json(
         os.path.join(FLAGS.save_dir, 'dataset_goal_conditioned.json'),
         {
@@ -337,6 +371,7 @@ def main(_):
     # Train agent.
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'train.csv'))
     eval_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'eval.csv'))
+    eval_episode_path = os.path.join(FLAGS.save_dir, 'eval_episodes.csv')
     stitch_debug_path = os.path.join(FLAGS.save_dir, 'stitch_debug.csv')
     first_time = time.time()
     last_time = time.time()
@@ -370,33 +405,51 @@ def main(_):
                 eval_agent = agent
             renders = []
             eval_metrics = {}
-            overall_metrics = defaultdict(list)
             task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
             num_tasks = FLAGS.eval_tasks if FLAGS.eval_tasks is not None else len(task_infos)
-            for task_id in tqdm.trange(1, num_tasks + 1):
-                task_name = task_infos[task_id - 1]['task_name']
-                eval_info, trajs, cur_renders = evaluate(
-                    agent=eval_agent,
-                    env=env,
-                    task_id=task_id,
-                    config=config,
-                    num_eval_episodes=FLAGS.eval_episodes,
-                    num_video_episodes=FLAGS.video_episodes,
-                    video_frame_skip=FLAGS.video_frame_skip,
-                    eval_temperature=FLAGS.eval_temperature,
-                    eval_gaussian=FLAGS.eval_gaussian,
-                )
-                renders.extend(cur_renders)
-                metric_names = ['success']
-                eval_metrics.update(
-                    {f'evaluation/{task_name}_{k}': v for k, v in eval_info.items() if k in metric_names}
-                )
-                for k, v in eval_info.items():
-                    if k in metric_names:
-                        overall_metrics[k].append(v)
-            for k, v in overall_metrics.items():
-                eval_metrics[f'evaluation/overall_{k}'] = np.mean(v)
-
+            # evaluate on each task
+            if config.get('policy_conditioning') == 'language':
+                eval_variants = tuple(config.get('language_eval_variants', ('canonical',)))
+            else:
+                eval_variants = (None,)
+            for eval_variant in eval_variants:
+                overall_metrics = defaultdict(list)
+                metric_prefix = '' if eval_variant in (None, 'canonical') else f'{eval_variant}/'
+                for task_id in tqdm.trange(1, num_tasks + 1):
+                    task_name = task_infos[task_id - 1]['task_name']
+                    eval_info, trajs, cur_renders, episode_summaries = evaluate(
+                        agent=eval_agent,
+                        env=env,
+                        task_id=task_id,
+                        config=config,
+                        num_eval_episodes=FLAGS.eval_episodes,
+                        num_video_episodes=(
+                            FLAGS.video_episodes if eval_variant in (None, 'canonical') else 0
+                        ),
+                        video_frame_skip=FLAGS.video_frame_skip,
+                        eval_temperature=FLAGS.eval_temperature,
+                        eval_gaussian=FLAGS.eval_gaussian,
+                        language_eval_variant=eval_variant or 'canonical',
+                        collect_diagnostics=FLAGS.eval_diagnostics,
+                    )
+                    renders.extend(cur_renders)
+                    for row in episode_summaries:
+                        row['task_name'] = task_name
+                    _append_csv_rows(eval_episode_path, episode_summaries, i)
+                    metric_names = {'success', *EVAL_DIAGNOSTIC_METRICS}
+                    eval_metrics.update(
+                        {
+                            f'evaluation/{metric_prefix}{task_name}_{k}': v
+                            for k, v in eval_info.items()
+                            if k in metric_names or k.startswith('failure/')
+                        }
+                    )
+                    for k, v in eval_info.items():
+                        if k in metric_names or k.startswith('failure/'):
+                            overall_metrics[k].append(v)
+                for k, v in overall_metrics.items():
+                    eval_metrics[f'evaluation/{metric_prefix}overall_{k}'] = np.mean(v)
+            # print(f"Evaluation metrics at step {i}: {eval_metrics}")
             if FLAGS.video_episodes > 0:
                 video = get_wandb_video(renders=renders, n_cols=num_tasks)
                 eval_metrics['video'] = video
