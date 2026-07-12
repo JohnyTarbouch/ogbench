@@ -239,8 +239,9 @@ def evaluate(
     trajs = []
     stats = defaultdict(list)
     policy_conditioning = config.get('policy_conditioning')
+    uses_language = policy_conditioning in {'language', 'goal_language'}
     language_cache = None
-    if policy_conditioning == 'language':
+    if uses_language:
         language_cache = load_language_cache(
             config['language_embedding_path'],
             int(config['num_language_tasks']),
@@ -258,22 +259,38 @@ def evaluate(
         goal_xyz = _task_goal_xyz(env)
         goal = info.get('goal')
         goal_frame = info.get('goal_rendered')
-        if policy_conditioning == 'language':
-            policy_condition = evaluation_language_embedding(
+        language_embedding = None
+        if uses_language:
+            language_embedding = evaluation_language_embedding(
                 language_cache,
                 task_id,
                 language_eval_variant,
                 i,
             )
             language_text = evaluation_language_text(language_cache, task_id, language_eval_variant, i)
+        if policy_conditioning == 'language':
+            policy_condition = language_embedding
         else:
             policy_condition = goal
+        if not uses_language:
             language_text = ''
         done = False
         step = 0
         render = []
         while not done:
-            action = actor_fn(observations=observation, goals=policy_condition, temperature=eval_temperature)
+            if policy_conditioning == 'goal_language':
+                action = actor_fn(
+                    observations=observation,
+                    goals=policy_condition,
+                    language_embeddings=language_embedding,
+                    temperature=eval_temperature,
+                )
+            else:
+                action = actor_fn(
+                    observations=observation,
+                    goals=policy_condition,
+                    temperature=eval_temperature,
+                )
             action = np.array(action)
             if not config.get('discrete'):
                 if eval_gaussian is not None:
@@ -311,7 +328,7 @@ def evaluate(
                 summary.update(
                     {
                         'task_id': int(task_id) if task_id is not None else -1,
-                        'language_variant': language_eval_variant if policy_conditioning == 'language' else 'goal',
+                        'language_variant': language_eval_variant if uses_language else 'goal',
                         'language_text': language_text,
                         'episode_index': i,
                     }

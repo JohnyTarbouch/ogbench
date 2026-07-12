@@ -646,9 +646,16 @@ class FutureGoalLanguageDataset(GCDataset):
             batch['next_observations'] = self.get_observations(idxs + 1)
 
         _, actor_goal_idxs = self.sample_goal_indices(idxs)
+        self._attach_future_language(batch, idxs, actor_goal_idxs, evaluation)
+        if not evaluation:
+            if self.config['p_aug'] is not None and np.random.rand() < self.config['p_aug']:
+                self.augment(batch, ['observations', 'next_observations'])
+        return batch
+
+    def _attach_future_language(self, batch, idxs, actor_goal_idxs, evaluation):
+        # attach language describing the same state selected as actor goal
         future_task_ids = self.state_task_ids[actor_goal_idxs]
         _attach_language_condition(self, batch, future_task_ids, evaluation)
-
         if not evaluation:
             offsets = actor_goal_idxs - idxs
             self._future_goal_count += len(idxs)
@@ -657,9 +664,6 @@ class FutureGoalLanguageDataset(GCDataset):
             self._future_goal_same_cell_count += int(
                 np.sum(future_task_ids == self.state_task_ids[idxs])
             )
-            if self.config['p_aug'] is not None and np.random.rand() < self.config['p_aug']:
-                self.augment(batch, ['observations', 'next_observations'])
-        return batch
 
     def get_and_reset_diagnostics(self):
         metrics = _get_and_reset_language_diagnostics(self)
@@ -677,6 +681,33 @@ class FutureGoalLanguageDataset(GCDataset):
         self._future_goal_same_state_count = 0
         self._future_goal_same_cell_count = 0
         return metrics
+
+
+@dataclasses.dataclass
+class FutureGoalImageLanguageDataset(FutureGoalLanguageDataset):
+    # OGBench goals paired with language for the same future state
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        if idxs is None:
+            idxs = self.dataset.get_random_idxs(batch_size)
+        idxs = np.asarray(idxs, dtype=np.int64)
+        batch = self.dataset.sample(len(idxs), idxs)
+        if self.config['frame_stack'] is not None:
+            batch['observations'] = self.get_observations(idxs)
+            batch['next_observations'] = self.get_observations(idxs + 1)
+
+        value_goal_idxs, actor_goal_idxs = self.sample_goal_indices(idxs)
+        batch['value_goals'] = self.get_observations(value_goal_idxs)
+        batch['actor_goals'] = self.get_observations(actor_goal_idxs)
+        successes = (idxs == value_goal_idxs).astype(float)
+        batch['masks'] = 1.0 - successes
+        batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
+        self._attach_future_language(batch, idxs, actor_goal_idxs, evaluation)
+
+        if not evaluation and self.config['p_aug'] is not None:
+            if np.random.rand() < self.config['p_aug']:
+                self.augment(batch, ['observations', 'next_observations', 'value_goals', 'actor_goals'])
+        return batch
 
 
 @dataclasses.dataclass

@@ -1,5 +1,6 @@
 from agents.crl import CRLAgent
 from agents.gcbc import GCBCAgent
+from agents.goal_language_bc import GoalLanguageBCAgent
 from agents.gciql import GCIQLAgent
 from agents.gcivl import GCIVLAgent
 from agents.hiql import HIQLAgent
@@ -12,6 +13,7 @@ from agents.sac import SACAgent
 agents = dict(
     crl=CRLAgent,
     gcbc=GCBCAgent,
+    goal_language_bc=GoalLanguageBCAgent,
     gciql=GCIQLAgent,
     gcivl=GCIVLAgent,
     hiql=HIQLAgent,

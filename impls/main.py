@@ -15,7 +15,14 @@ import wandb
 from absl import app, flags
 from agents import agents
 from ml_collections import config_flags
-from utils.datasets import AtomicLanguageDataset, Dataset, FutureGoalLanguageDataset, GCDataset, HGCDataset
+from utils.datasets import (
+    AtomicLanguageDataset,
+    Dataset,
+    FutureGoalImageLanguageDataset,
+    FutureGoalLanguageDataset,
+    GCDataset,
+    HGCDataset,
+)
 from utils.env_utils import make_env_and_datasets
 from utils.evaluation import EVAL_DIAGNOSTIC_METRICS, evaluate
 from utils.flax_utils import restore_agent, save_agent
@@ -284,6 +291,7 @@ def main(_):
 
     dataset_class = {
         'AtomicLanguageDataset': AtomicLanguageDataset,
+        'FutureGoalImageLanguageDataset': FutureGoalImageLanguageDataset,
         'FutureGoalLanguageDataset': FutureGoalLanguageDataset,
         'GCDataset': GCDataset,
         'HGCDataset': HGCDataset,
@@ -296,7 +304,7 @@ def main(_):
     train_dataset_kwargs = {}
     if dataset_class is AtomicLanguageDataset:
         train_dataset_kwargs['manifest_path'] = config['atomic_train_manifest_path']
-    elif dataset_class is FutureGoalLanguageDataset:
+    elif dataset_class in {FutureGoalLanguageDataset, FutureGoalImageLanguageDataset}:
         train_dataset_kwargs['labels_path'] = config['future_language_train_labels_path']
     train_dataset = dataset_class(Dataset.create(**train_dataset), config, **train_dataset_kwargs)
     if val_dataset is not None:
@@ -311,7 +319,7 @@ def main(_):
         val_dataset_kwargs = {}
         if val_dataset_class is AtomicLanguageDataset:
             val_dataset_kwargs['manifest_path'] = config['atomic_val_manifest_path']
-        elif val_dataset_class is FutureGoalLanguageDataset:
+        elif val_dataset_class in {FutureGoalLanguageDataset, FutureGoalImageLanguageDataset}:
             val_dataset_kwargs['labels_path'] = config['future_language_val_labels_path']
         val_dataset = val_dataset_class(Dataset.create(**val_dataset), config, **val_dataset_kwargs)
     _write_json(
@@ -408,7 +416,7 @@ def main(_):
             task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
             num_tasks = FLAGS.eval_tasks if FLAGS.eval_tasks is not None else len(task_infos)
             # evaluate on each task
-            if config.get('policy_conditioning') == 'language':
+            if config.get('policy_conditioning') in {'language', 'goal_language'}:
                 eval_variants = tuple(config.get('language_eval_variants', ('canonical',)))
             else:
                 eval_variants = (None,)
