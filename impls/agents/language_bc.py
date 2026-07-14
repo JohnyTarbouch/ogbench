@@ -100,17 +100,28 @@ def get_config():
                 dataset_class='AtomicLanguageDataset',
                 policy_conditioning='language',
                 language_dataset_mode='atomic_movement',
+                endpoint_dataset_mode='stable_achieved_endpoint',
+                endpoint_sampling='uniform_transitions',
+                endpoint_train_manifest_path='',
+                endpoint_val_manifest_path='',
                 num_language_tasks=ml_collections.config_dict.placeholder(int),
                 atomic_train_manifest_path='',
                 atomic_val_manifest_path='',
                 future_language_train_labels_path='',
                 future_language_val_labels_path='',
                 language_embedding_path='',
+                language_embedding_model='',
+                language_embedding_sha256='',
                 language_embedding_dim=512,
+                language_min_train_retrieval_top1=0.0,
+                language_min_heldout_retrieval_top1=0.0,
                 language_hidden_dims=(256, 256),
                 language_latent_dim=256,
                 language_train_variant='canonical',
+                
+                language_train_control='none',
                 language_eval_variants=('canonical', 'heldout'),
+                language_final_eval_variants=('canonical', 'heldout'),
             )
         )
     )

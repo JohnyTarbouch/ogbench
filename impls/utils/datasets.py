@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 from functools import partial
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -7,13 +8,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.core.frozen_dict import FrozenDict
-from utils.language import load_language_cache
+from utils.language import language_retrieval_top1, load_language_cache
 
 
 def get_size(data):
     """Return the size of the dataset."""
     sizes = jax.tree_util.tree_map(lambda arr: len(arr), data)
     return max(jax.tree_util.tree_leaves(sizes))
+
+
+def _file_sha256(path, chunk_size=8 * 1024 * 1024):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as file:
+        while chunk := file.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @partial(jax.jit, static_argnames=('padding',))
@@ -61,15 +70,18 @@ def random_shifts_batch(batch, keys, pad=2, rng=None):
     This stays on the host with NumPy, matching the common DrQ random-shift
     augmentation style: edge-pad, then crop each image by a random integer shift.
     """
-    rng = np.random.default_rng() if rng is None else rng
-
     for key in keys:
         arr = batch[key]
         if getattr(arr, 'ndim', 0) != 4:
             continue
 
         n = arr.shape[0]
-        shifts = rng.integers(0, 2 * pad + 1, size=(n, 2))
+        if rng is None:
+            shifts = np.random.randint(0, 2 * pad + 1, size=(n, 2))
+        elif hasattr(rng, 'integers'):
+            shifts = rng.integers(0, 2 * pad + 1, size=(n, 2))
+        else:
+            shifts = rng.randint(0, 2 * pad + 1, size=(n, 2))
         batch[key] = shift_batch_np(np.asarray(arr), shifts, pad)
 
     return batch
@@ -237,6 +249,14 @@ class GCDataset:
         (self.terminal_locs,) = np.nonzero(self.dataset['terminals'] > 0)
         self.initial_locs = np.concatenate([[0], self.terminal_locs[:-1] + 1])
         assert self.terminal_locs[-1] == self.size - 1
+        if 'valids' in self.dataset:
+            valids = np.asarray(self.dataset['valids'])
+            if valids.shape != (self.size,) or np.any(~np.isin(valids, (0, 1))):
+                raise ValueError('Compact valids must be a one-dimensional binary array.')
+            action_free_locs = np.flatnonzero(valids == 0)
+            if len(action_free_locs) == 0 or action_free_locs[-1] != self.size - 1:
+                raise ValueError('Compact data must end in an action-free state.')
+            self.initial_locs = np.concatenate([[0], action_free_locs[:-1] + 1])
 
         # Assert probabilities sum to 1.
         assert np.isclose(
@@ -373,18 +393,44 @@ class GCDataset:
 
 
 def _initialize_language_conditioning(owner):
-    # Load the language embedding 
-    # set up the language conditioning
+    """Load and validate the frozen language-conditioning artifact."""
     cache = load_language_cache(
         owner.config['language_embedding_path'],
         int(owner.config['num_language_tasks']),
         int(owner.config['language_embedding_dim']),
     )
+    cache_sha256 = _file_sha256(cache['path'])
+    expected_model = str(owner.config.get('language_embedding_model', '') or '')
+    if expected_model and cache['model_name'] != expected_model:
+        raise ValueError(
+            f"Language cache model {cache['model_name']!r} does not match expected {expected_model!r}."
+        )
+    expected_sha256 = str(owner.config.get('language_embedding_sha256', '') or '')
+    if expected_sha256 and cache_sha256 != expected_sha256:
+        raise ValueError('Language cache SHA-256 does not match the configured artifact.')
+    retrieval = {
+        split: language_retrieval_top1(cache, split) for split in ('train', 'heldout')
+    }
+    for split, score in retrieval.items():
+        minimum = float(owner.config.get(f'language_min_{split}_retrieval_top1', 0.0))
+        if not 0.0 <= minimum <= 1.0:
+            raise ValueError(f'language_min_{split}_retrieval_top1 must lie in [0, 1].')
+        if minimum > 0.0 and score is None:
+            raise ValueError(f'Language cache has no {split} retrieval diagnostics.')
+        if score is not None and score + 1e-12 < minimum:
+            raise ValueError(
+                f'Language cache {split} retrieval top-1 {score:.4f} is below '
+                f'the configured minimum {minimum:.4f}.'
+            )
     train_variant = str(owner.config.get('language_train_variant', 'canonical'))
     if train_variant not in {'canonical', 'train'}:
         raise ValueError("language_train_variant must be 'canonical' or 'train'.")
+    train_control = str(owner.config.get('language_train_control', 'none'))
+    if train_control not in {'none', 'zero'}:
+        raise ValueError("language_train_control must be 'none' or 'zero'.")
     owner.language_cache = cache
     owner.language_train_variant = train_variant
+    owner.language_train_control = train_control
     owner._language_task_counts = np.zeros(int(owner.config['num_language_tasks']), dtype=np.int64)
     owner._language_variant_counts = np.zeros(
         1 if train_variant == 'canonical' else cache['train_embeddings'].shape[1],
@@ -392,13 +438,20 @@ def _initialize_language_conditioning(owner):
     )
     owner.language_summary = {
         'path': cache['path'],
+        'cache_sha256': cache_sha256,
         'model_name': cache['model_name'],
         'normalized': cache['normalized'],
         'embedding_dim': int(cache['canonical_embeddings'].shape[-1]),
         'train_variant': train_variant,
+        'train_control': train_control,
         'train_variants_per_task': int(cache['train_embeddings'].shape[1]),
         'heldout_variants_per_task': int(cache['heldout_embeddings'].shape[1]),
+        'train_retrieval_top1': retrieval['train'],
+        'heldout_retrieval_top1': retrieval['heldout'],
     }
+    for optional_key in ('pooling', 'task_spec_sha256'):
+        if optional_key in cache:
+            owner.language_summary[optional_key] = cache[optional_key]
 
 
 def _attach_language_condition(owner, batch, task_ids, evaluation):
@@ -407,7 +460,14 @@ def _attach_language_condition(owner, batch, task_ids, evaluation):
     if np.any(task_ids < 1) or np.any(task_ids > num_tasks):
         raise ValueError(f'Language task IDs must be in [1, {num_tasks}].')
     task_rows = task_ids - 1
-    if evaluation or owner.language_train_variant == 'canonical':
+    
+    if owner.language_train_control == 'zero':
+        embeddings = np.zeros(
+            (len(task_rows), int(owner.config['language_embedding_dim'])),
+            dtype=np.float32,
+        )
+        variant_idxs = np.zeros(len(task_rows), dtype=np.int32)
+    elif evaluation or owner.language_train_variant == 'canonical':
         embeddings = owner.language_cache['canonical_embeddings'][task_rows]
         variant_idxs = np.zeros(len(task_rows), dtype=np.int32)
     else:
@@ -423,7 +483,10 @@ def _attach_language_condition(owner, batch, task_ids, evaluation):
 
 def _get_and_reset_language_diagnostics(owner):
     total = int(np.sum(owner._language_task_counts))
-    metrics = {'data/language_samples': float(total)}
+    metrics = {
+        'data/language_samples': float(total),
+        'data/language_train_control_zero': float(owner.language_train_control == 'zero'),
+    }
     if total:
         for task_idx, count in enumerate(owner._language_task_counts, start=1):
             metrics[f'data/task_{task_idx}_fraction'] = float(count / total)
@@ -565,6 +628,311 @@ class AtomicLanguageDataset(_AtomicSegmentDataset):
         return _get_and_reset_language_diagnostics(self)
 
 
+def _actions_valids_fingerprint(dataset):
+    digest = hashlib.sha256()
+    for key in ('actions', 'valids'):
+        if key not in dataset:
+            raise ValueError(f"Endpoint datasets require compact data key {key!r}.")
+        array = np.asarray(dataset[key])
+        digest.update(key.encode('utf-8'))
+        digest.update(str(array.dtype).encode('ascii'))
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(np.ascontiguousarray(array).view(np.uint8))
+    return digest.hexdigest()
+
+
+@dataclasses.dataclass
+class _EndpointManifestDataset(GCDataset):
+    """
+    Selected transitions paired with one achieved episode endpoint
+    """
+
+    preprocess_frame_stack: bool = False
+    manifest_path: Optional[Union[str, Path]] = None
+    source_path: Optional[Union[str, Path]] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if 'next_observations' in self.dataset or 'valids' not in self.dataset:
+            raise ValueError('Endpoint datasets require compact observations with a valids array.')
+        if self.manifest_path is None:
+            raise ValueError('Endpoint datasets require manifest_path.')
+
+        self.raw_size = self.dataset.size
+        raw_valids = np.asarray(self.dataset['valids'])
+        if raw_valids.shape != (self.raw_size,) or np.any(~np.isin(raw_valids, (0, 1))):
+            raise ValueError('Compact valids must be a one-dimensional binary array.')
+        self.raw_goal_indices = np.flatnonzero(raw_valids == 0).astype(np.int64)
+        if len(self.raw_goal_indices) == 0 or self.raw_goal_indices[-1] != self.raw_size - 1:
+            raise ValueError('Compact data must end in an action-free endpoint row.')
+        self.raw_episode_starts = np.concatenate(
+            [np.asarray([0], dtype=np.int64), self.raw_goal_indices[:-1] + 1]
+        )
+        if np.any(self.raw_episode_starts >= self.raw_goal_indices):
+            raise ValueError('Every compact episode must contain at least one valid transition.')
+        expected_valids = np.ones(self.raw_size, dtype=raw_valids.dtype)
+        expected_valids[self.raw_goal_indices] = 0
+        if not np.array_equal(raw_valids, expected_valids):
+            raise ValueError('Compact valids must contain exactly one action-free row per episode.')
+
+        manifest_path = Path(self.manifest_path).expanduser().resolve()
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f'Endpoint manifest not found: {manifest_path}')
+        required = {
+            'schema_version',
+            'source_dataset_name',
+            'source_split',
+            'source_num_states',
+            'source_num_valid_transitions',
+            'source_num_episodes',
+            'source_file_sha256',
+            'source_actions_valids_sha256',
+            'task_spec_sha256',
+            'endpoint_id',
+            'episode_id',
+            'episode_start_index',
+            'goal_index',
+            'start_ij',
+            'goal_ij',
+            'task_id',
+            'bfs_distance',
+            'transition_indices',
+            'transition_endpoint_ids',
+            'task_ids',
+            'task_ij',
+            'maze_map',
+            'stability_window',
+            'required_bfs_distance',
+            'endpoint_rule',
+        }
+        with np.load(manifest_path, allow_pickle=False) as manifest:
+            missing = required.difference(manifest.files)
+            if missing:
+                raise ValueError(f'Endpoint manifest is missing keys: {sorted(missing)}')
+            values = {key: np.asarray(manifest[key]) for key in required}
+
+        def scalar(key, cast):
+            value = values[key]
+            if value.shape != ():
+                raise ValueError(f'Endpoint manifest {key} must be a scalar.')
+            return cast(value.item())
+
+        schema_version = scalar('schema_version', int)
+        if schema_version != 1:
+            raise ValueError(f'Unsupported endpoint manifest schema: {schema_version!r}.')
+        source_num_states = scalar('source_num_states', int)
+        source_num_valid = scalar('source_num_valid_transitions', int)
+        source_num_episodes = scalar('source_num_episodes', int)
+        if source_num_states != self.raw_size:
+            raise ValueError(
+                f'Endpoint manifest has {source_num_states} states; dataset has {self.raw_size}.'
+            )
+        if source_num_valid != int(np.sum(raw_valids)):
+            raise ValueError('Endpoint manifest valid-transition count does not match the dataset.')
+        if source_num_episodes != len(self.raw_goal_indices):
+            raise ValueError('Endpoint manifest episode count does not match the compact dataset.')
+        source_fingerprint = scalar('source_actions_valids_sha256', str)
+        if source_fingerprint != _actions_valids_fingerprint(self.dataset):
+            raise ValueError('Endpoint manifest actions/valids fingerprint does not match the dataset.')
+
+        task_ids = np.asarray(values['task_ids'], dtype=np.int32)
+        task_ij = np.asarray(values['task_ij'], dtype=np.int32)
+        maze_map = np.asarray(values['maze_map'], dtype=np.int8)
+        expected_task_ids = np.arange(1, len(task_ids) + 1, dtype=np.int32)
+        if not np.array_equal(task_ids, expected_task_ids):
+            raise ValueError('Endpoint task IDs must be consecutive and one-indexed.')
+        if task_ij.shape != (len(task_ids), 2) or len(np.unique(task_ij, axis=0)) != len(task_ids):
+            raise ValueError('Endpoint task_ij must contain one unique cell per task.')
+        open_ij = np.argwhere(maze_map == 0).astype(np.int32)
+        if not np.array_equal(task_ij, open_ij):
+            raise ValueError('Endpoint tasks must list every open maze cell in row-major order.')
+
+        endpoint_ids = np.asarray(values['endpoint_id'], dtype=np.int64)
+        episode_ids = np.asarray(values['episode_id'], dtype=np.int64)
+        episode_starts = np.asarray(values['episode_start_index'], dtype=np.int64)
+        goal_indices = np.asarray(values['goal_index'], dtype=np.int64)
+        start_ij = np.asarray(values['start_ij'], dtype=np.int32)
+        goal_ij = np.asarray(values['goal_ij'], dtype=np.int32)
+        endpoint_task_ids = np.asarray(values['task_id'], dtype=np.int32)
+        bfs_distances = np.asarray(values['bfs_distance'], dtype=np.int32)
+        num_endpoints = len(endpoint_ids)
+        one_dimensional = (episode_ids, episode_starts, goal_indices, endpoint_task_ids, bfs_distances)
+        if any(array.shape != (num_endpoints,) for array in one_dimensional):
+            raise ValueError('Endpoint-level manifest arrays have inconsistent lengths.')
+        if start_ij.shape != (num_endpoints, 2) or goal_ij.shape != (num_endpoints, 2):
+            raise ValueError('Endpoint start_ij and goal_ij must have shape (num_endpoints, 2).')
+        if not np.array_equal(endpoint_ids, np.arange(num_endpoints, dtype=np.int64)):
+            raise ValueError('Endpoint IDs must be consecutive and zero-indexed.')
+        if len(np.unique(episode_ids)) != num_endpoints:
+            raise ValueError('Endpoint manifest contains duplicate episode IDs.')
+        if np.any(episode_ids < 0) or np.any(episode_ids >= len(self.raw_goal_indices)):
+            raise ValueError('Endpoint manifest contains an out-of-range episode ID.')
+        if not np.array_equal(episode_starts, self.raw_episode_starts[episode_ids]):
+            raise ValueError('Endpoint manifest episode starts do not match compact valids.')
+        if not np.array_equal(goal_indices, self.raw_goal_indices[episode_ids]):
+            raise ValueError('Endpoint manifest goal indices do not match action-free endpoint rows.')
+        if np.any(endpoint_task_ids < 1) or np.any(endpoint_task_ids > len(task_ids)):
+            raise ValueError('Endpoint manifest contains an out-of-range task ID.')
+        if not np.array_equal(task_ij[endpoint_task_ids - 1], goal_ij):
+            raise ValueError('Endpoint task IDs do not agree with their goal_ij cells.')
+        required_distance = scalar('required_bfs_distance', int)
+        if np.any(bfs_distances != required_distance):
+            raise ValueError('Endpoint manifest contains a trajectory with the wrong BFS distance.')
+
+        transition_indices = np.asarray(values['transition_indices'], dtype=np.int64)
+        transition_endpoint_ids = np.asarray(values['transition_endpoint_ids'], dtype=np.int64)
+        expected_transition_indices = np.concatenate(
+            [np.arange(start, goal, dtype=np.int64) for start, goal in zip(episode_starts, goal_indices)]
+        )
+        expected_transition_endpoint_ids = np.repeat(
+            endpoint_ids, goal_indices - episode_starts
+        )
+        if not np.array_equal(transition_indices, expected_transition_indices):
+            raise ValueError('Endpoint transition indices do not exactly cover each retained episode.')
+        if not np.array_equal(transition_endpoint_ids, expected_transition_endpoint_ids):
+            raise ValueError('Endpoint transition-to-endpoint mapping is invalid.')
+        if len(np.unique(transition_indices)) != len(transition_indices):
+            raise ValueError('Endpoint manifest contains duplicate transition indices.')
+        if np.any(raw_valids[transition_indices] != 1):
+            raise ValueError('Endpoint manifest includes an action-free row as a transition.')
+
+        self.manifest_path = manifest_path
+        self.transition_indices = transition_indices
+        self.transition_endpoint_ids = transition_endpoint_ids.astype(np.int32)
+        self.endpoint_episode_ids = episode_ids.astype(np.int32)
+        self.endpoint_goal_indices = goal_indices
+        self.endpoint_task_ids = endpoint_task_ids
+        self.task_ids = task_ids
+        self.task_ij = task_ij
+        self.task_spec_sha256 = scalar('task_spec_sha256', str)
+        self.source_file_sha256 = scalar('source_file_sha256', str)
+        self.source_path = (
+            Path(self.source_path).expanduser().resolve() if self.source_path is not None else None
+        )
+        if self.source_path is not None:
+            if not self.source_path.is_file():
+                raise FileNotFoundError(f'Endpoint source dataset not found: {self.source_path}')
+            if _file_sha256(self.source_path) != self.source_file_sha256:
+                raise ValueError('Endpoint manifest source-file SHA-256 does not match the dataset archive.')
+        self.source_dataset_name = scalar('source_dataset_name', str)
+        self.source_split = scalar('source_split', str)
+        self.size = len(transition_indices)
+        self.endpoint_sampling = str(self.config.get('endpoint_sampling', 'uniform_transitions'))
+        if self.endpoint_sampling not in {'uniform_tasks', 'uniform_transitions'}:
+            raise ValueError("endpoint_sampling must be 'uniform_tasks' or 'uniform_transitions'.")
+        self._positions_by_task = [
+            np.flatnonzero(self.endpoint_task_ids[self.transition_endpoint_ids] == task_id)
+            for task_id in self.task_ids
+        ]
+        if any(len(positions) == 0 for positions in self._positions_by_task):
+            raise ValueError('Every endpoint task must have at least one retained transition.')
+        self._endpoint_task_counts = np.zeros(len(self.task_ids), dtype=np.int64)
+        task_values, task_counts = np.unique(endpoint_task_ids, return_counts=True)
+        self.endpoint_manifest_summary = {
+            'path': str(manifest_path),
+            'manifest_sha256': _file_sha256(manifest_path),
+            'schema_version': schema_version,
+            'source_dataset_name': self.source_dataset_name,
+            'source_split': self.source_split,
+            'source_file_sha256': self.source_file_sha256,
+            'source_path': str(self.source_path) if self.source_path is not None else None,
+            'source_file_verified': self.source_path is not None,
+            'source_actions_valids_sha256': source_fingerprint,
+            'task_spec_sha256': self.task_spec_sha256,
+            'raw_dataset_size': int(self.raw_size),
+            'raw_num_episodes': int(len(self.raw_goal_indices)),
+            'num_retained_episodes': int(num_endpoints),
+            'num_transitions': int(self.size),
+            'stability_window': scalar('stability_window', int),
+            'required_bfs_distance': required_distance,
+            'endpoint_rule': scalar('endpoint_rule', str),
+            'sampling': self.endpoint_sampling,
+            'episodes_per_task': {
+                str(int(task_id)): int(count) for task_id, count in zip(task_values, task_counts)
+            },
+        }
+
+    def _sample_positions(self, batch_size):
+        if self.endpoint_sampling == 'uniform_transitions':
+            return np.random.randint(self.size, size=batch_size)
+        task_rows = np.random.randint(len(self.task_ids), size=batch_size)
+        return np.asarray(
+            [
+                self._positions_by_task[task_row][np.random.randint(len(self._positions_by_task[task_row]))]
+                for task_row in task_rows
+            ],
+            dtype=np.int64,
+        )
+
+    def get_observations(self, idxs):
+        idxs = np.asarray(idxs, dtype=np.int64)
+        if self.config['frame_stack'] is None:
+            return jax.tree_util.tree_map(lambda arr: arr[idxs], self.dataset['observations'])
+        episode_rows = np.searchsorted(self.raw_goal_indices, idxs)
+        if np.any(episode_rows >= len(self.raw_goal_indices)):
+            raise IndexError('Observation index lies beyond the final compact episode.')
+        episode_starts = self.raw_episode_starts[episode_rows]
+        stacks = []
+        for offset in reversed(range(self.config['frame_stack'])):
+            stack_idxs = np.maximum(idxs - offset, episode_starts)
+            stacks.append(jax.tree_util.tree_map(lambda arr: arr[stack_idxs], self.dataset['observations']))
+        return jax.tree_util.tree_map(lambda *arrays: np.concatenate(arrays, axis=-1), *stacks)
+
+    def _sample_endpoint(self, batch_size, idxs=None, evaluation=False):
+        positions = self._sample_positions(batch_size) if idxs is None else np.asarray(idxs, dtype=np.int64)
+        if positions.ndim != 1 or np.any(positions < 0) or np.any(positions >= self.size):
+            raise IndexError(f'Endpoint dataset positions must be in [0, {self.size - 1}].')
+        raw_idxs = self.transition_indices[positions]
+        endpoint_ids = self.transition_endpoint_ids[positions]
+        task_ids = self.endpoint_task_ids[endpoint_ids]
+        batch = self.dataset.sample(len(positions), raw_idxs)
+        if self.config['frame_stack'] is not None:
+            batch['observations'] = self.get_observations(raw_idxs)
+            batch['next_observations'] = self.get_observations(raw_idxs + 1)
+        if not evaluation:
+            np.add.at(self._endpoint_task_counts, task_ids - 1, 1)
+        return batch, task_ids, self.endpoint_goal_indices[endpoint_ids]
+
+    def _get_and_reset_endpoint_diagnostics(self):
+        total = int(np.sum(self._endpoint_task_counts))
+        metrics = {'data/endpoint_samples': float(total)}
+        if total:
+            for task_id, count in enumerate(self._endpoint_task_counts, start=1):
+                metrics[f'data/endpoint_task_{task_id}_fraction'] = float(count / total)
+        self._endpoint_task_counts.fill(0)
+        return metrics
+
+
+@dataclasses.dataclass
+class EndpointLanguageDataset(_EndpointManifestDataset):
+    """Transitions conditioned on language"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        mode = str(self.config.get('endpoint_dataset_mode', 'stable_achieved_endpoint'))
+        if mode != 'stable_achieved_endpoint':
+            raise ValueError("EndpointLanguageDataset requires endpoint_dataset_mode='stable_achieved_endpoint'.")
+        _initialize_language_conditioning(self)
+        cache_task_ij = self.language_cache.get('task_ij')
+        if cache_task_ij is None or not np.array_equal(cache_task_ij, self.task_ij):
+            raise ValueError('Language cache task_ij does not match the endpoint manifest.')
+        cache_spec_sha = self.language_cache.get('task_spec_sha256')
+        if cache_spec_sha != self.task_spec_sha256:
+            raise ValueError('Language cache task-spec fingerprint does not match the endpoint manifest.')
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        batch, task_ids, _ = self._sample_endpoint(batch_size, idxs=idxs, evaluation=evaluation)
+        _attach_language_condition(self, batch, task_ids, evaluation)
+        if not evaluation and self.config['p_aug'] is not None and np.random.rand() < self.config['p_aug']:
+            self.augment(batch, ['observations', 'next_observations'])
+        return batch
+
+    def get_and_reset_diagnostics(self):
+        metrics = self._get_and_reset_endpoint_diagnostics()
+        metrics.update(_get_and_reset_language_diagnostics(self))
+        return metrics
+
+
 @dataclasses.dataclass
 class FutureGoalLanguageDataset(GCDataset):
     """Standard OGBench future-goal sampling with goal images replaced by language.
@@ -577,6 +945,7 @@ class FutureGoalLanguageDataset(GCDataset):
 
     preprocess_frame_stack: bool = False
     labels_path: Optional[Union[str, Path]] = None
+    source_path: Optional[Union[str, Path]] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -596,10 +965,65 @@ class FutureGoalLanguageDataset(GCDataset):
             missing = required.difference(labels.files)
             if missing:
                 raise ValueError(f'Future-goal language labels are missing keys: {sorted(missing)}')
-            state_task_ids = np.asarray(labels['state_task_ids'], dtype=np.int32)
-            task_ids = np.asarray(labels['task_ids'], dtype=np.int32)
-            source_num_states = int(labels['source_num_states'])
-            outside_grid_states = int(labels['num_outside_grid_states']) if 'num_outside_grid_states' in labels else 0
+            state_task_ids_raw = np.asarray(labels['state_task_ids'])
+            task_ids_raw = np.asarray(labels['task_ids'])
+            state_task_ids = np.asarray(state_task_ids_raw, dtype=np.int32)
+            task_ids = np.asarray(task_ids_raw, dtype=np.int32)
+            source_num_states_raw = np.asarray(labels['source_num_states'])
+            source_num_states = int(source_num_states_raw)
+            outside_grid_states_raw = (
+                np.asarray(labels['num_outside_grid_states'])
+                if 'num_outside_grid_states' in labels
+                else None
+            )
+            outside_grid_states = int(outside_grid_states_raw) if outside_grid_states_raw is not None else 0
+            provenance_keys = {
+                'schema_version',
+                'source_dataset_name',
+                'source_split',
+                'source_file_sha256',
+                'source_actions_valids_sha256',
+                'source_num_valid_transitions',
+                'source_num_episodes',
+                'task_spec_sha256',
+                'label_rule',
+                'state_ij',
+                'task_ij',
+                'maze_map',
+            }
+            provenance = {
+                key: np.asarray(labels[key]) for key in provenance_keys if key in labels.files
+            }
+
+        if 'schema_version' in provenance:
+            antmaze_required = provenance_keys
+            missing = antmaze_required.difference(provenance)
+            if missing:
+                raise ValueError(
+                    f'Versioned future-goal labels are missing provenance keys: {sorted(missing)}'
+                )
+            if provenance['schema_version'].dtype != np.dtype(np.int32):
+                raise ValueError('Future-goal schema_version must have dtype int32.')
+            if provenance['schema_version'].shape != () or int(provenance['schema_version']) != 1:
+                raise ValueError('Unsupported future-goal language-label schema version.')
+            expected_dtypes = {
+                'source_num_valid_transitions': np.dtype(np.int64),
+                'source_num_episodes': np.dtype(np.int64),
+                'state_ij': np.dtype(np.int32),
+                'task_ij': np.dtype(np.int32),
+                'maze_map': np.dtype(np.int8),
+            }
+            for key, expected_dtype in expected_dtypes.items():
+                if provenance[key].dtype != expected_dtype:
+                    raise ValueError(
+                        f'Future-goal provenance key {key!r} must have dtype {expected_dtype}.'
+                    )
+            if state_task_ids_raw.dtype != np.dtype(np.int32) or task_ids_raw.dtype != np.dtype(np.int32):
+                raise ValueError('Versioned future-goal task ID arrays must have dtype int32.')
+            if source_num_states_raw.dtype != np.dtype(np.int64) or source_num_states_raw.shape != ():
+                raise ValueError('Versioned future-goal source_num_states must be an int64 scalar.')
+            if outside_grid_states_raw is None or outside_grid_states_raw.dtype != np.dtype(np.int64):
+                raise ValueError('Versioned future-goal num_outside_grid_states must have dtype int64.')
 
         num_tasks = int(self.config['num_language_tasks'])
         expected_task_ids = np.arange(1, num_tasks + 1, dtype=np.int32)
@@ -618,11 +1042,74 @@ class FutureGoalLanguageDataset(GCDataset):
         if np.any(state_task_ids < 1) or np.any(state_task_ids > num_tasks):
             raise ValueError(f'Future-goal state task IDs must be in [1, {num_tasks}].')
 
+        if 'schema_version' in provenance:
+            def provenance_scalar(key, cast):
+                value = provenance[key]
+                if value.shape != ():
+                    raise ValueError(f'Future-goal provenance key {key!r} must be scalar.')
+                return cast(value.item())
+
+            if 'valids' not in self.dataset:
+                raise ValueError('Versioned future-goal labels require compact data with valids.')
+            num_valid = int(np.sum(self.dataset['valids'] > 0))
+            num_episodes = int(np.sum(self.dataset['valids'] == 0))
+            if provenance_scalar('source_num_valid_transitions', int) != num_valid:
+                raise ValueError('Future-goal label valid-transition count does not match the dataset.')
+            if provenance_scalar('source_num_episodes', int) != num_episodes:
+                raise ValueError('Future-goal label episode count does not match the dataset.')
+            if provenance_scalar('source_actions_valids_sha256', str) != _actions_valids_fingerprint(self.dataset):
+                raise ValueError('Future-goal label actions/valids fingerprint does not match the dataset.')
+
+            source_sha256 = provenance_scalar('source_file_sha256', str)
+            if len(source_sha256) != 64 or any(character not in '0123456789abcdef' for character in source_sha256):
+                raise ValueError('Future-goal source_file_sha256 is not a lowercase SHA-256 digest.')
+            if self.source_path is None:
+                raise ValueError('Versioned future-goal labels require source_path for archive verification.')
+            source_path = Path(self.source_path).expanduser().resolve()
+            if not source_path.is_file():
+                raise FileNotFoundError(f'Future-goal source archive not found: {source_path}')
+            if _file_sha256(source_path) != source_sha256:
+                raise ValueError('Future-goal label source archive checksum does not match the dataset file.')
+            expected_split = 'val' if source_path.stem.endswith('-val') else 'train'
+            expected_dataset_name = (
+                source_path.stem[:-4] if expected_split == 'val' else source_path.stem
+            )
+            if provenance_scalar('source_split', str) != expected_split:
+                raise ValueError('Future-goal label source split does not match the dataset file.')
+            if provenance_scalar('source_dataset_name', str) != expected_dataset_name:
+                raise ValueError('Future-goal label dataset name does not match the dataset file.')
+            if provenance_scalar('label_rule', str) != 'strict_qpos_xy_open_cell':
+                raise ValueError('Unsupported AntMaze future-goal label rule.')
+
+            task_ij = np.asarray(provenance['task_ij'], dtype=np.int32)
+            state_ij = np.asarray(provenance['state_ij'], dtype=np.int32)
+            maze_map = np.asarray(provenance['maze_map'], dtype=np.int8)
+            if task_ij.shape != (num_tasks, 2) or len(np.unique(task_ij, axis=0)) != num_tasks:
+                raise ValueError('Future-goal task_ij must contain one unique cell per task.')
+            if not np.array_equal(task_ij, np.argwhere(maze_map == 0).astype(np.int32)):
+                raise ValueError('Future-goal task_ij must list all open maze cells in row-major order.')
+            if maze_map.shape != (8, 8) or np.any(~np.isin(maze_map, (0, 1))):
+                raise ValueError('Future-goal AntMaze maze_map must be a binary 8x8 array.')
+            if state_ij.shape != (self.dataset.size, 2):
+                raise ValueError(
+                    f'Future-goal state_ij has shape {state_ij.shape}; expected {(self.dataset.size, 2)}.'
+                )
+            if not np.array_equal(task_ij[state_task_ids - 1], state_ij):
+                raise ValueError('Future-goal state task IDs do not agree with state_ij.')
+            if outside_grid_states != 0:
+                raise ValueError('Versioned AntMaze future-goal labels may not contain outside-grid states.')
+            self.task_ij = task_ij
+            self.task_spec_sha256 = provenance_scalar('task_spec_sha256', str)
+            self.source_actions_valids_sha256 = provenance_scalar(
+                'source_actions_valids_sha256', str
+            )
+
         self.labels_path = labels_path
         self.state_task_ids = state_task_ids
         task_values, task_counts = np.unique(state_task_ids, return_counts=True)
         self.future_label_summary = {
             'path': str(labels_path),
+            'labels_sha256': _file_sha256(labels_path),
             'raw_dataset_size': int(self.dataset.size),
             'num_outside_grid_states': outside_grid_states,
             'states_per_task': {
@@ -630,11 +1117,32 @@ class FutureGoalLanguageDataset(GCDataset):
                 for task_id, count in zip(task_values, task_counts)
             },
         }
+        if 'schema_version' in provenance:
+            self.future_label_summary.update(
+                {
+                    'schema_version': provenance_scalar('schema_version', int),
+                    'source_dataset_name': provenance_scalar('source_dataset_name', str),
+                    'source_split': provenance_scalar('source_split', str),
+                    'source_file_sha256': provenance_scalar('source_file_sha256', str),
+                    'source_actions_valids_sha256': self.source_actions_valids_sha256,
+                    'source_num_valid_transitions': provenance_scalar(
+                        'source_num_valid_transitions', int
+                    ),
+                    'source_num_episodes': provenance_scalar('source_num_episodes', int),
+                    'task_spec_sha256': self.task_spec_sha256,
+                    'label_rule': provenance_scalar('label_rule', str),
+                }
+            )
         self._future_goal_count = 0
         self._future_goal_offset_sum = 0
         self._future_goal_same_state_count = 0
         self._future_goal_same_cell_count = 0
         _initialize_language_conditioning(self)
+        if 'schema_version' in provenance:
+            if not np.array_equal(self.language_cache.get('task_ij'), self.task_ij):
+                raise ValueError('Language cache task_ij does not match future-goal labels.')
+            if self.language_cache.get('task_spec_sha256') != self.task_spec_sha256:
+                raise ValueError('Language cache task-spec fingerprint does not match future-goal labels.')
 
     def sample(self, batch_size, idxs=None, evaluation=False):
         if idxs is None:

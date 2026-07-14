@@ -3,7 +3,11 @@ from collections import defaultdict
 import jax
 import numpy as np
 from tqdm import trange
-from utils.language import evaluation_language_embedding, evaluation_language_text, load_language_cache
+from utils.language import (
+    evaluation_language_condition,
+    language_task_id_for_goal,
+    load_language_cache,
+)
 
 
 EVAL_DIAGNOSTIC_METRICS = (
@@ -216,6 +220,7 @@ def evaluate(
     eval_gaussian=None,
     language_eval_variant='canonical',
     collect_diagnostics=False,
+    evaluation_seed=0,
 ):
     """Evaluate the agent in the environment.
 
@@ -230,12 +235,12 @@ def evaluate(
         eval_temperature: Action sampling temperature.
         eval_gaussian: Standard deviation of the Gaussian noise to add to the actions.
         language_eval_variant: Canonical or held-out language condition to use.
-        collect_diagnostics: Whether to compute compact per-episode behavioral summaries.
+        collect_diagnostics: Whether to add Cube-specific behavioral diagnostics to
+        the always-recorded basic episode conditions and outcomes.
 
     Returns:
         A tuple containing statistics, trajectories, rendered videos, and episode summaries.
     """
-    actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
     trajs = []
     stats = defaultdict(list)
     policy_conditioning = config.get('policy_conditioning')
@@ -250,97 +255,150 @@ def evaluate(
 
     renders = []
     episode_summaries = []
-    for i in trange(num_eval_episodes + num_video_episodes):
-        traj = defaultdict(list)
-        should_render = i >= num_eval_episodes
-
-        observation, info = env.reset(options=dict(task_id=task_id, render_goal=should_render))
-        initial_info = info.copy()
-        goal_xyz = _task_goal_xyz(env)
-        goal = info.get('goal')
-        goal_frame = info.get('goal_rendered')
-        language_embedding = None
-        if uses_language:
-            language_embedding = evaluation_language_embedding(
-                language_cache,
-                task_id,
-                language_eval_variant,
-                i,
+    numpy_state = np.random.get_state()
+    try:
+        episode_iterator = trange(num_eval_episodes + num_video_episodes)
+        for i in episode_iterator:
+            traj = defaultdict(list)
+            should_render = i >= num_eval_episodes
+            episode_seed = int(
+                np.random.SeedSequence([int(evaluation_seed), int(task_id or 0), int(i)])
+                .generate_state(1, dtype=np.uint32)[0]
             )
-            language_text = evaluation_language_text(language_cache, task_id, language_eval_variant, i)
-        if policy_conditioning == 'language':
-            policy_condition = language_embedding
-        else:
-            policy_condition = goal
-        if not uses_language:
-            language_text = ''
-        done = False
-        step = 0
-        render = []
-        while not done:
-            if policy_conditioning == 'goal_language':
-                action = actor_fn(
-                    observations=observation,
-                    goals=policy_condition,
-                    language_embeddings=language_embedding,
-                    temperature=eval_temperature,
+            # environment resets, actor sampling, and optional Gaussian
+            # noise across variants and model seeds
+            np.random.seed(episode_seed)
+            env.action_space.seed(episode_seed)
+            actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(episode_seed))
+            gaussian_rng = np.random.default_rng(episode_seed)
+            observation, info = env.reset(
+                seed=episode_seed,
+                options=dict(task_id=task_id, render_goal=should_render),
+            )
+            initial_info = info.copy()
+            goal_xyz = _task_goal_xyz(env)
+            goal = info.get('goal')
+            goal_frame = info.get('goal_rendered')
+            language_embedding = None
+            target_language_task_id = None
+            condition_language_task_id = None
+            task_info = getattr(env.unwrapped, 'cur_task_info', None)
+            goal_ij = task_info.get('goal_ij') if isinstance(task_info, dict) else None
+            if uses_language:
+                target_language_task_id = language_task_id_for_goal(
+                    language_cache,
+                    goal_ij,
+                    fallback_task_id=task_id,
+                ) if goal_ij is not None else int(task_id)
+                (
+                    language_embedding,
+                    language_text,
+                    condition_language_task_id,
+                ) = evaluation_language_condition(
+                    language_cache,
+                    target_language_task_id,
+                    language_eval_variant,
+                    i,
                 )
+            if policy_conditioning == 'language':
+                policy_condition = language_embedding
             else:
-                action = actor_fn(
-                    observations=observation,
-                    goals=policy_condition,
-                    temperature=eval_temperature,
-                )
-            action = np.array(action)
-            if not config.get('discrete'):
-                if eval_gaussian is not None:
-                    action = np.random.normal(action, eval_gaussian)
-                action = np.clip(action, -1, 1)
-
-            next_observation, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            step += 1
-
-            if should_render and (step % video_frame_skip == 0 or done):
-                frame = env.render().copy()
-                if goal_frame is not None:
-                    render.append(np.concatenate([goal_frame, frame], axis=0))
+                policy_condition = goal
+            if not uses_language:
+                language_text = ''
+            done = False
+            step = 0
+            render = []
+            while not done:
+                if policy_conditioning == 'goal_language':
+                    action = actor_fn(
+                        observations=observation,
+                        goals=policy_condition,
+                        language_embeddings=language_embedding,
+                        temperature=eval_temperature,
+                    )
                 else:
-                    render.append(frame)
+                    action = actor_fn(
+                        observations=observation,
+                        goals=policy_condition,
+                        temperature=eval_temperature,
+                    )
+                action = np.array(action)
+                if not config.get('discrete'):
+                    if eval_gaussian is not None:
+                        action = gaussian_rng.normal(action, eval_gaussian)
+                    action = np.clip(action, -1, 1)
 
-            transition = dict(
-                observation=observation,
-                next_observation=next_observation,
-                action=action,
-                reward=reward,
-                done=done,
-                terminated=terminated,
-                truncated=truncated,
-                info=info,
-            )
-            add_to(traj, transition)
-            observation = next_observation
-        if i < num_eval_episodes:
-            add_to(stats, flatten(info))
-            trajs.append(traj)
-            if collect_diagnostics:
-                summary = summarize_episode(initial_info, traj, goal_xyz=goal_xyz)
-                summary.update(
-                    {
-                        'task_id': int(task_id) if task_id is not None else -1,
-                        'language_variant': language_eval_variant if uses_language else 'goal',
-                        'language_text': language_text,
-                        'episode_index': i,
-                    }
+                next_observation, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+                step += 1
+
+                if should_render and (step % video_frame_skip == 0 or done):
+                    frame = env.render().copy()
+                    if goal_frame is not None:
+                        render.append(np.concatenate([goal_frame, frame], axis=0))
+                    else:
+                        render.append(frame)
+
+                transition = dict(
+                    observation=observation,
+                    next_observation=next_observation,
+                    action=action,
+                    reward=reward,
+                    done=done,
+                    terminated=terminated,
+                    truncated=truncated,
+                    info=info,
                 )
+                add_to(traj, transition)
+                observation = next_observation
+            if i < num_eval_episodes:
+                flat_info = flatten(info)
+                add_to(stats, flat_info)
+                trajs.append(traj)
+                summary = {
+                    'task_id': int(task_id) if task_id is not None else -1,
+                    'environment_task_id': int(task_id) if task_id is not None else -1,
+                    'language_task_id': (
+                        int(target_language_task_id)
+                        if target_language_task_id is not None
+                        else -1
+                    ),
+                    'language_condition_task_id': (
+                        int(condition_language_task_id)
+                        if condition_language_task_id is not None
+                        else -1
+                    ),
+                    'language_variant': language_eval_variant if uses_language else 'goal',
+                    'language_text': language_text,
+                    'episode_index': i,
+                    'evaluation_seed': episode_seed,
+                    'success': float(bool(flat_info.get('success', False))),
+                    'episode_length': int(len(traj['info'])),
+                    'goal_i': (
+                        int(np.asarray(goal_ij, dtype=np.int32).reshape(-1)[0])
+                        if goal_ij is not None and np.asarray(goal_ij).size == 2
+                        else None
+                    ),
+                    'goal_j': (
+                        int(np.asarray(goal_ij, dtype=np.int32).reshape(-1)[1])
+                        if goal_ij is not None and np.asarray(goal_ij).size == 2
+                        else None
+                    ),
+                }
+                if collect_diagnostics:
+                    summary.update(summarize_episode(initial_info, traj, goal_xyz=goal_xyz))
                 episode_summaries.append(summary)
-        else:
-            renders.append(np.array(render))
+            else:
+                renders.append(np.array(render))
+    finally:
+        # Evaluation must not perturb the training dataset/augmentation stream.
+        np.random.set_state(numpy_state)
 
     for k, v in stats.items():
         stats[k] = np.mean(v)
 
-    if episode_summaries:
+    if collect_diagnostics and episode_summaries:
         for metric in EVAL_DIAGNOSTIC_METRICS:
             values = np.asarray([summary[metric] for summary in episode_summaries], dtype=np.float64)
             values = values[np.isfinite(values)]

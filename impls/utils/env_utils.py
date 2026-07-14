@@ -76,7 +76,7 @@ class FrameStackWrapper(gymnasium.Wrapper):
         return self.get_observation(), reward, terminated, truncated, info
 
 
-def make_env_and_datasets(dataset_name, frame_stack=None):
+def make_env_and_datasets(dataset_name, frame_stack=None, add_noise_to_goal=None):
     """Make OGBench environment and datasets.
 
     Args:
@@ -92,6 +92,8 @@ def make_env_and_datasets(dataset_name, frame_stack=None):
     dataset_kwargs = dict(compact_dataset=True)
     if dataset_dir:
         dataset_kwargs['dataset_dir'] = dataset_dir
+    if add_noise_to_goal is not None:
+        dataset_kwargs['add_noise_to_goal'] = bool(add_noise_to_goal)
     env, train_dataset, val_dataset = ogbench.make_env_and_datasets(dataset_name, **dataset_kwargs)
     train_dataset = Dataset.create(**train_dataset)
     val_dataset = Dataset.create(**val_dataset)

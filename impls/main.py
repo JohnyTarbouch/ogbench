@@ -1,4 +1,6 @@
 import csv
+import glob
+import hashlib
 import json
 import os
 import platform
@@ -18,6 +20,7 @@ from ml_collections import config_flags
 from utils.datasets import (
     AtomicLanguageDataset,
     Dataset,
+    EndpointLanguageDataset,
     FutureGoalImageLanguageDataset,
     FutureGoalLanguageDataset,
     GCDataset,
@@ -39,6 +42,7 @@ flags.DEFINE_string('env_name', 'antmaze-large-navigate-v0', 'Environment (datas
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
+flags.DEFINE_bool('eval_only', False, 'Evaluate a restored checkpoint without updating or saving it.')
 
 flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
@@ -52,7 +56,14 @@ flags.DEFINE_float('eval_gaussian', None, 'Action Gaussian noise for evaluation.
 flags.DEFINE_integer('video_episodes', 1, 'Number of video episodes for each task.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
+flags.DEFINE_bool('eval_at_start', True, 'Whether to evaluate the randomly initialized policy at step 1.')
+flags.DEFINE_bool(
+    'eval_goal_noise',
+    None,
+    'Whether locomaze evaluation goals use within-cell noise; None preserves the environment default.',
+)
 flags.DEFINE_bool('eval_diagnostics', False, 'Whether to save compact rollout diagnostics.')
+flags.DEFINE_integer('eval_seed', 0, 'Base seed for paired, reproducible evaluation episodes.')
 
 config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
@@ -71,6 +82,26 @@ def _json_default(value):
 def _write_json(path, data):
     with open(path, 'w') as f:
         json.dump(data, f, indent=2, sort_keys=True, default=_json_default)
+
+
+def _file_sha256(path, chunk_size=8 * 1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as file:
+        while chunk := file.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_restore_path(pattern, epoch, seed):
+    formatted = pattern.replace('%SEED3%', f'{seed:03d}').replace('%SEED%', str(seed))
+    candidates = glob.glob(formatted)
+    if len(candidates) != 1:
+        raise ValueError(f'Restore pattern matched {len(candidates)} directories: {formatted!r}')
+    directory = os.path.abspath(candidates[0])
+    checkpoint = os.path.join(directory, f'params_{epoch}.pkl')
+    if not os.path.isfile(checkpoint):
+        raise FileNotFoundError(f'Restore checkpoint not found: {checkpoint}')
+    return formatted, checkpoint
 
 
 def _append_csv_rows(path, rows, step):
@@ -102,7 +133,17 @@ def _dataset_summary(name, dataset):
     }
     if 'valids' in dataset:
         summary['num_valid'] = int(np.sum(dataset['valids'] > 0))
-    if 'terminals' in dataset:
+        endpoint_idxs = np.flatnonzero(dataset['valids'] == 0)
+        if len(endpoint_idxs):
+            initial_idxs = np.concatenate([[0], endpoint_idxs[:-1] + 1])
+            lengths = endpoint_idxs - initial_idxs + 1
+            summary['num_trajectories'] = int(len(endpoint_idxs))
+            summary['trajectory_length'] = {
+                'min': int(np.min(lengths)),
+                'mean': float(np.mean(lengths)),
+                'max': int(np.max(lengths)),
+            }
+    elif 'terminals' in dataset:
         terminal_idxs = np.flatnonzero(dataset['terminals'] > 0)
         summary['num_trajectories'] = int(len(terminal_idxs))
         if len(terminal_idxs) > 0:
@@ -128,9 +169,37 @@ def _goal_dataset_summary(name, goal_dataset):
     if hasattr(goal_dataset, 'future_label_summary'):
         # print(f"Future goal language label summary for {name}: {goal_dataset.future_label_summary}")
         summary['future_goal_language_labels'] = goal_dataset.future_label_summary
+    if hasattr(goal_dataset, 'endpoint_manifest_summary'):
+        summary['endpoint_manifest'] = goal_dataset.endpoint_manifest_summary
+        summary['num_trajectories'] = goal_dataset.endpoint_manifest_summary['num_retained_episodes']
     if hasattr(goal_dataset, 'language_summary'):
         summary['language'] = goal_dataset.language_summary
-    if len(goal_dataset.terminal_locs) > 0:
+    if hasattr(goal_dataset, 'endpoint_goal_indices'):
+        starts = goal_dataset.raw_episode_starts[goal_dataset.endpoint_episode_ids]
+        lengths = goal_dataset.endpoint_goal_indices - starts
+        summary['trajectory_length'] = {
+            'min': int(np.min(lengths)),
+            'mean': float(np.mean(lengths)),
+            'max': int(np.max(lengths)),
+        }
+    elif hasattr(goal_dataset, 'raw_goal_indices'):
+        lengths = goal_dataset.raw_goal_indices - goal_dataset.raw_episode_starts + 1
+        summary['trajectory_length'] = {
+            'min': int(np.min(lengths)),
+            'mean': float(np.mean(lengths)),
+            'max': int(np.max(lengths)),
+        }
+    elif 'valids' in goal_dataset.dataset:
+        endpoint_idxs = np.flatnonzero(goal_dataset.dataset['valids'] == 0)
+        initial_idxs = np.concatenate([[0], endpoint_idxs[:-1] + 1])
+        lengths = endpoint_idxs - initial_idxs + 1
+        summary['num_trajectories'] = int(len(endpoint_idxs))
+        summary['trajectory_length'] = {
+            'min': int(np.min(lengths)),
+            'mean': float(np.mean(lengths)),
+            'max': int(np.max(lengths)),
+        }
+    elif len(goal_dataset.terminal_locs) > 0:
         lengths = goal_dataset.terminal_locs - goal_dataset.initial_locs + 1
         summary['trajectory_length'] = {
             'min': int(np.min(lengths)),
@@ -155,15 +224,25 @@ def _goal_sampling_summary(config):
         'frame_stack',
         'policy_conditioning',
         'language_dataset_mode',
+        'endpoint_dataset_mode',
+        'endpoint_sampling',
+        'endpoint_train_manifest_path',
+        'endpoint_val_manifest_path',
         'num_language_tasks',
         'atomic_train_manifest_path',
         'atomic_val_manifest_path',
         'future_language_train_labels_path',
         'future_language_val_labels_path',
         'language_embedding_path',
+        'language_embedding_model',
+        'language_embedding_sha256',
         'language_embedding_dim',
+        'language_min_train_retrieval_top1',
+        'language_min_heldout_retrieval_top1',
         'language_train_variant',
+        'language_train_control',
         'language_eval_variants',
+        'language_final_eval_variants',
     ]
     stitch_keys = sorted(
         key for key in config.keys() 
@@ -279,7 +358,11 @@ def main(_):
     )
 
     # Set up environment and dataset.
-    env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=config['frame_stack'])
+    env, train_dataset, val_dataset = make_env_and_datasets(
+        FLAGS.env_name,
+        frame_stack=config['frame_stack'],
+        add_noise_to_goal=FLAGS.eval_goal_noise,
+    )
     _write_json(
         os.path.join(FLAGS.save_dir, 'dataset_raw.json'),
         {
@@ -291,6 +374,7 @@ def main(_):
 
     dataset_class = {
         'AtomicLanguageDataset': AtomicLanguageDataset,
+        'EndpointLanguageDataset': EndpointLanguageDataset,
         'FutureGoalImageLanguageDataset': FutureGoalImageLanguageDataset,
         'FutureGoalLanguageDataset': FutureGoalLanguageDataset,
         'GCDataset': GCDataset,
@@ -304,8 +388,16 @@ def main(_):
     train_dataset_kwargs = {}
     if dataset_class is AtomicLanguageDataset:
         train_dataset_kwargs['manifest_path'] = config['atomic_train_manifest_path']
+    elif dataset_class is EndpointLanguageDataset:
+        train_dataset_kwargs['manifest_path'] = config['endpoint_train_manifest_path']
+        dataset_dir = os.environ.get('OGBENCH_DATASET_DIR') or os.environ.get('OGBENCH_DATA_DIR')
+        if dataset_dir:
+            train_dataset_kwargs['source_path'] = os.path.join(dataset_dir, f'{FLAGS.env_name}.npz')
     elif dataset_class in {FutureGoalLanguageDataset, FutureGoalImageLanguageDataset}:
         train_dataset_kwargs['labels_path'] = config['future_language_train_labels_path']
+        dataset_dir = os.environ.get('OGBENCH_DATASET_DIR') or os.environ.get('OGBENCH_DATA_DIR')
+        if dataset_dir:
+            train_dataset_kwargs['source_path'] = os.path.join(dataset_dir, f'{FLAGS.env_name}.npz')
     train_dataset = dataset_class(Dataset.create(**train_dataset), config, **train_dataset_kwargs)
     if val_dataset is not None:
         stitch_dataset_classes = {
@@ -319,8 +411,20 @@ def main(_):
         val_dataset_kwargs = {}
         if val_dataset_class is AtomicLanguageDataset:
             val_dataset_kwargs['manifest_path'] = config['atomic_val_manifest_path']
+        elif val_dataset_class is EndpointLanguageDataset:
+            val_dataset_kwargs['manifest_path'] = config['endpoint_val_manifest_path']
+            dataset_dir = os.environ.get('OGBENCH_DATASET_DIR') or os.environ.get('OGBENCH_DATA_DIR')
+            if dataset_dir:
+                val_dataset_kwargs['source_path'] = os.path.join(
+                    dataset_dir, f'{FLAGS.env_name}-val.npz'
+                )
         elif val_dataset_class in {FutureGoalLanguageDataset, FutureGoalImageLanguageDataset}:
             val_dataset_kwargs['labels_path'] = config['future_language_val_labels_path']
+            dataset_dir = os.environ.get('OGBENCH_DATASET_DIR') or os.environ.get('OGBENCH_DATA_DIR')
+            if dataset_dir:
+                val_dataset_kwargs['source_path'] = os.path.join(
+                    dataset_dir, f'{FLAGS.env_name}-val.npz'
+                )
         val_dataset = val_dataset_class(Dataset.create(**val_dataset), config, **val_dataset_kwargs)
     _write_json(
         os.path.join(FLAGS.save_dir, 'dataset_goal_conditioned.json'),
@@ -373,8 +477,26 @@ def main(_):
         )
 
     # Restore agent.
+    if FLAGS.eval_only and (FLAGS.restore_path is None or FLAGS.restore_epoch is None):
+        raise ValueError('--eval_only requires both --restore_path and --restore_epoch.')
     if FLAGS.restore_path is not None:
-        agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
+        formatted_restore_path, checkpoint_path = _resolve_restore_path(
+            FLAGS.restore_path, FLAGS.restore_epoch, FLAGS.seed
+        )
+        if os.path.dirname(checkpoint_path) == os.path.abspath(FLAGS.save_dir):
+            raise ValueError('Evaluation output directory may not equal the source checkpoint directory.')
+        agent = restore_agent(agent, formatted_restore_path, FLAGS.restore_epoch)
+        _write_json(
+            os.path.join(FLAGS.save_dir, 'checkpoint_restore.json'),
+            {
+                'requested_pattern': FLAGS.restore_path,
+                'formatted_pattern': formatted_restore_path,
+                'checkpoint_path': checkpoint_path,
+                'checkpoint_sha256': _file_sha256(checkpoint_path),
+                'restore_epoch': FLAGS.restore_epoch,
+                'eval_only': FLAGS.eval_only,
+            },
+        )
 
     # Train agent.
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'train.csv'))
@@ -383,13 +505,15 @@ def main(_):
     stitch_debug_path = os.path.join(FLAGS.save_dir, 'stitch_debug.csv')
     first_time = time.time()
     last_time = time.time()
-    for i in tqdm.tqdm(range(1, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
-        # Update agent.
-        batch = train_dataset.sample(config['batch_size'])
-        agent, update_info = agent.update(batch)
+    iteration_steps = [FLAGS.restore_epoch] if FLAGS.eval_only else range(1, FLAGS.train_steps + 1)
+    for i in tqdm.tqdm(iteration_steps, smoothing=0.1, dynamic_ncols=True):
+        if not FLAGS.eval_only:
+            # Update agent.
+            batch = train_dataset.sample(config['batch_size'])
+            agent, update_info = agent.update(batch)
 
         # Log metrics.
-        if i % FLAGS.log_interval == 0:
+        if not FLAGS.eval_only and i % FLAGS.log_interval == 0:
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             if val_dataset is not None:
                 val_batch = val_dataset.sample(config['batch_size'], evaluation=True)
@@ -406,7 +530,13 @@ def main(_):
             train_logger.log(train_metrics, step=i)
 
         # Evaluate agent.
-        if i == 1 or i % FLAGS.eval_interval == 0:
+        should_evaluate = (
+            FLAGS.eval_only
+            or (FLAGS.eval_at_start and i == 1)
+            or i % FLAGS.eval_interval == 0
+            or i == FLAGS.train_steps
+        )
+        if should_evaluate:
             if FLAGS.eval_on_cpu:
                 eval_agent = jax.device_put(agent, device=jax.devices('cpu')[0])
             else:
@@ -417,7 +547,12 @@ def main(_):
             num_tasks = FLAGS.eval_tasks if FLAGS.eval_tasks is not None else len(task_infos)
             # evaluate on each task
             if config.get('policy_conditioning') in {'language', 'goal_language'}:
-                eval_variants = tuple(config.get('language_eval_variants', ('canonical',)))
+                periodic_variants = tuple(config.get('language_eval_variants', ('canonical',)))
+                final_variants = config.get('language_final_eval_variants')
+                if final_variants is None:
+                    final_variants = periodic_variants
+                use_final_variants = FLAGS.eval_only or i == FLAGS.train_steps
+                eval_variants = tuple(final_variants if use_final_variants else periodic_variants)
             else:
                 eval_variants = (None,)
             for eval_variant in eval_variants:
@@ -439,6 +574,7 @@ def main(_):
                         eval_gaussian=FLAGS.eval_gaussian,
                         language_eval_variant=eval_variant or 'canonical',
                         collect_diagnostics=FLAGS.eval_diagnostics,
+                        evaluation_seed=FLAGS.eval_seed,
                     )
                     renders.extend(cur_renders)
                     for row in episode_summaries:
@@ -466,7 +602,7 @@ def main(_):
             eval_logger.log(eval_metrics, step=i)
 
         # Save agent.
-        if i % FLAGS.save_interval == 0:
+        if not FLAGS.eval_only and i % FLAGS.save_interval == 0:
             save_agent(agent, FLAGS.save_dir, i)
 
     train_logger.close()

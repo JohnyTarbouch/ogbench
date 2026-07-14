@@ -6,6 +6,9 @@ from pathlib import Path
 import numpy as np
 
 
+SUPPORTED_LANGUAGE_EVAL_VARIANTS = ('canonical', 'heldout', 'zero', 'shuffled')
+
+
 @lru_cache(maxsize=8)
 def load_language_cache(path, num_tasks, embedding_dim):
     resolved = Path(path).expanduser().resolve()
@@ -28,6 +31,16 @@ def load_language_cache(path, num_tasks, embedding_dim):
         cache = {key: np.asarray(data[key]) for key in required}
         cache['model_name'] = str(data['model_name']) if 'model_name' in data.files else 'unknown'
         cache['normalized'] = bool(data['normalized']) if 'normalized' in data.files else False
+        if 'task_ij' in data.files:
+            cache['task_ij'] = np.asarray(data['task_ij'], dtype=np.int32)
+        if 'task_spec_sha256' in data.files:
+            cache['task_spec_sha256'] = str(data['task_spec_sha256'])
+        if 'pooling' in data.files:
+            cache['pooling'] = str(data['pooling'])
+        for split in ('train', 'heldout'):
+            key = f'{split}_nearest_task_ids'
+            if key in data.files:
+                cache[key] = np.asarray(data[key], dtype=np.int32)
 
     expected_task_ids = np.arange(1, num_tasks + 1, dtype=np.int32)
     if not np.array_equal(cache['task_ids'], expected_task_ids):
@@ -51,6 +64,12 @@ def load_language_cache(path, num_tasks, embedding_dim):
                 f'expected {(*texts.shape, embedding_dim)}.'
             )
 
+    if 'task_ij' in cache:
+        if cache['task_ij'].shape != (num_tasks, 2):
+            raise ValueError(f"task_ij has shape {cache['task_ij'].shape}; expected {(num_tasks, 2)}.")
+        if len(np.unique(cache['task_ij'], axis=0)) != num_tasks:
+            raise ValueError('task_ij must contain one unique cell per language task.')
+
     for key in ('canonical_embeddings', 'train_embeddings', 'heldout_embeddings'):
         embeddings = np.asarray(cache[key], dtype=np.float32)
         if not np.all(np.isfinite(embeddings)):
@@ -66,26 +85,91 @@ def load_language_cache(path, num_tasks, embedding_dim):
     return cache
 
 
-def evaluation_language_embedding(cache, task_id, variant, episode_index):
+def language_retrieval_top1(cache, split):
+    """Return cached task-retrieval accuracy, or ``None`` if unavailable."""
+    if split not in {'train', 'heldout'}:
+        raise ValueError("split must be 'train' or 'heldout'.")
+    key = f'{split}_nearest_task_ids'
+    if key not in cache:
+        return None
+    nearest = np.asarray(cache[key], dtype=np.int32)
+    expected_shape = cache[f'{split}_texts'].shape
+    if nearest.shape != expected_shape:
+        raise ValueError(f'{key} has shape {nearest.shape}; expected {expected_shape}.')
+    expected = np.broadcast_to(cache['task_ids'][:, None], expected_shape)
+    return float(np.mean(nearest == expected))
+
+
+def language_task_id_for_goal(cache, goal_ij, fallback_task_id=None):
+    """
+    Map environment goal cell to its language task ID
+    """
+    if 'task_ij' not in cache:
+        if fallback_task_id is None:
+            raise ValueError('Language cache has no task_ij mapping and no fallback task ID was supplied.')
+        return int(fallback_task_id)
+    goal_ij = np.asarray(goal_ij, dtype=np.int32)
+    if goal_ij.shape != (2,):
+        raise ValueError(f'Environment goal_ij must have shape (2,), got {goal_ij.shape}.')
+    matches = np.flatnonzero(np.all(cache['task_ij'] == goal_ij, axis=1))
+    if len(matches) != 1:
+        raise ValueError(f'Environment goal cell {goal_ij.tolist()} is absent or duplicated in the language cache.')
+    return int(matches[0] + 1)
+
+
+def _validate_evaluation_request(cache, task_id, variant, episode_index):
     if task_id < 1 or task_id > len(cache['task_ids']):
         raise ValueError(f'Language task ID {task_id} is out of range.')
-    task_index = task_id - 1
-    if variant == 'canonical':
-        return cache['canonical_embeddings'][task_index]
-    if variant == 'heldout':
-        variants = cache['heldout_embeddings'][task_index]
-        return variants[episode_index % len(variants)]
-    raise ValueError(f'Unsupported language evaluation variant: {variant!r}')
+    if variant not in SUPPORTED_LANGUAGE_EVAL_VARIANTS:
+        raise ValueError(f'Unsupported language evaluation variant: {variant!r}')
+    if episode_index < 0:
+        raise ValueError('Language evaluation episode_index must be nonnegative.')
+
+
+def evaluation_language_condition_task_id(cache, task_id, variant, episode_index):
+    """
+    Return the task ID represented by an evaluation language condition.
+    """
+    _validate_evaluation_request(cache, task_id, variant, episode_index)
+    if variant in {'canonical', 'heldout'}:
+        return int(task_id)
+    if variant == 'zero':
+        return 0
+    num_tasks = len(cache['task_ids'])
+    if num_tasks < 2:
+        raise ValueError('Shuffled-language evaluation requires at least two tasks.')
+    offset = episode_index % (num_tasks - 1) + 1
+    return int((task_id - 1 + offset) % num_tasks + 1)
+
+
+def evaluation_language_condition(cache, task_id, variant, episode_index):
+    condition_task_id = evaluation_language_condition_task_id(
+        cache, task_id, variant, episode_index
+    )
+    if variant == 'zero':
+        embedding = np.zeros_like(cache['canonical_embeddings'][task_id - 1], dtype=np.float32)
+        return embedding, '<zero-language-embedding>', condition_task_id
+
+    condition_index = condition_task_id - 1
+    if variant in {'canonical', 'shuffled'}:
+        return (
+            cache['canonical_embeddings'][condition_index],
+            str(cache['canonical_texts'][condition_index]),
+            condition_task_id,
+        )
+
+    embeddings = cache['heldout_embeddings'][condition_index]
+    texts = cache['heldout_texts'][condition_index]
+    if len(embeddings) == 0 or len(texts) == 0:
+        raise ValueError('Held-out language evaluation requires at least one variant.')
+    variant_index = episode_index % len(embeddings)
+    return embeddings[variant_index], str(texts[variant_index]), condition_task_id
+
+
+def evaluation_language_embedding(cache, task_id, variant, episode_index):
+    return evaluation_language_condition(cache, task_id, variant, episode_index)[0]
 
 
 def evaluation_language_text(cache, task_id, variant, episode_index):
     """Return the exact instruction paired with an evaluation episode."""
-    if task_id < 1 or task_id > len(cache['task_ids']):
-        raise ValueError(f'Language task ID {task_id} is out of range.')
-    task_index = task_id - 1
-    if variant == 'canonical':
-        return str(cache['canonical_texts'][task_index])
-    if variant == 'heldout':
-        texts = cache['heldout_texts'][task_index]
-        return str(texts[episode_index % len(texts)])
-    raise ValueError(f'Unsupported language evaluation variant: {variant!r}')
+    return evaluation_language_condition(cache, task_id, variant, episode_index)[1]
