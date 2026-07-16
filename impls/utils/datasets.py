@@ -505,7 +505,7 @@ class _AtomicSegmentDataset(GCDataset):
 
     Manifest positions form this dataset's public index space. Each position
     maps to one transition in the original compact OGBench dataset and one
-    language-task label. Keeping the original dataset intact lets frame
+    atomic segment. Keeping the original dataset intact lets frame
     stacking use the true episode boundaries without copying image observations.
     """
 
@@ -518,7 +518,7 @@ class _AtomicSegmentDataset(GCDataset):
         super().__post_init__()
         self.raw_size = self.dataset.size
         if self.manifest_path is None:
-            raise ValueError('AtomicLanguageDataset requires manifest_path.')
+            raise ValueError('Atomic segment datasets require manifest_path.')
 
         manifest_path = Path(self.manifest_path).expanduser().resolve()
         if not manifest_path.is_file():
@@ -537,6 +537,26 @@ class _AtomicSegmentDataset(GCDataset):
                 if 'episode_id' in manifest.files
                 else None
             )
+            segment_goal_indices = (
+                np.asarray(manifest['goal_index'], dtype=np.int64)
+                if 'goal_index' in manifest.files
+                else None
+            )
+            segment_ids = (
+                np.asarray(manifest['segment_id'], dtype=np.int64)
+                if 'segment_id' in manifest.files
+                else None
+            )
+            segment_start_indices = (
+                np.asarray(manifest['start_index'], dtype=np.int64)
+                if 'start_index' in manifest.files
+                else None
+            )
+            segment_num_transitions = (
+                np.asarray(manifest['num_transitions'], dtype=np.int64)
+                if 'num_transitions' in manifest.files
+                else None
+            )
 
         if transition_indices.ndim != 1 or transition_segment_ids.ndim != 1:
             raise ValueError('Atomic manifest transition arrays must be one-dimensional.')
@@ -553,19 +573,81 @@ class _AtomicSegmentDataset(GCDataset):
         if len(np.unique(transition_indices)) != len(transition_indices):
             raise ValueError('Atomic manifest contains duplicate transition indices.')
 
+        num_segments = len(segment_task_ids)
+        if segment_episode_ids is not None and segment_episode_ids.shape != (num_segments,):
+            raise ValueError('Atomic manifest episode_id must have one entry per segment.')
+        if segment_goal_indices is not None:
+            if segment_goal_indices.shape != (num_segments,):
+                raise ValueError('Atomic manifest goal_index must have one entry per segment.')
+            if np.any(segment_goal_indices < 0) or np.any(segment_goal_indices >= self.raw_size):
+                raise ValueError(f'Atomic goal indices must lie in [0, {self.raw_size - 1}].')
+        if segment_ids is not None and not np.array_equal(segment_ids, np.arange(num_segments)):
+            raise ValueError('Atomic manifest segment_id must equal consecutive row indices.')
+
+        structural_arrays = (segment_start_indices, segment_num_transitions, segment_goal_indices)
+        if any(array is not None for array in structural_arrays):
+            if not all(array is not None for array in structural_arrays):
+                raise ValueError(
+                    'Atomic manifest must provide start_index, goal_index, and num_transitions together.'
+                )
+            for name, array in zip(
+                ('start_index', 'num_transitions', 'goal_index'), structural_arrays
+            ):
+                if array.shape != (num_segments,):
+                    raise ValueError(f'Atomic manifest {name} must have one entry per segment.')
+            if np.any(segment_start_indices < 0) or np.any(
+                segment_start_indices >= segment_goal_indices
+            ):
+                raise ValueError('Atomic segment start_index must be nonnegative and precede goal_index.')
+            if not np.array_equal(
+                segment_num_transitions, segment_goal_indices - segment_start_indices
+            ):
+                raise ValueError('Atomic num_transitions must equal goal_index - start_index.')
+            expected_segment_ids = np.repeat(np.arange(num_segments), segment_num_transitions)
+            expected_transition_indices = np.concatenate(
+                [
+                    np.arange(start, goal, dtype=np.int64)
+                    for start, goal in zip(segment_start_indices, segment_goal_indices)
+                ]
+            )
+            if not np.array_equal(transition_segment_ids, expected_segment_ids):
+                raise ValueError('Atomic transition_segment_ids do not encode contiguous segments.')
+            if not np.array_equal(transition_indices, expected_transition_indices):
+                raise ValueError('Atomic transition_indices do not equal the declared [start, goal) ranges.')
+
         final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, transition_indices)]
         if np.any(transition_indices >= final_state_idxs):
             raise ValueError('Atomic manifest includes a terminal transition without an in-episode successor.')
 
+        if 'valids' in self.dataset and np.any(
+            np.asarray(self.dataset['valids'])[transition_indices] <= 0
+        ):
+            raise ValueError('Atomic manifest includes an action-free transition row.')
+
+        if segment_goal_indices is not None:
+            transition_goal_indices = segment_goal_indices[transition_segment_ids]
+            if np.any(transition_indices >= transition_goal_indices):
+                raise ValueError('Atomic goals must be strictly later than their transitions.')
+            if 'valids' in self.dataset:
+                episode_end_indices = np.flatnonzero(np.asarray(self.dataset['valids']) <= 0)
+            else:
+                episode_end_indices = self.terminal_locs
+            transition_episode_rows = np.searchsorted(
+                episode_end_indices, transition_indices, side='left'
+            )
+            goal_episode_rows = np.searchsorted(
+                episode_end_indices, transition_goal_indices, side='left'
+            )
+            if np.any(transition_episode_rows != goal_episode_rows):
+                raise ValueError('Atomic transition and goal indices must belong to the same episode.')
+
         task_ids = segment_task_ids[transition_segment_ids]
-        num_language_tasks = int(self.config['num_language_tasks'])
-        if np.any(task_ids < 1) or np.any(task_ids > num_language_tasks):
-            raise ValueError(f'Atomic task IDs must be in [1, {num_language_tasks}].')
 
         self.manifest_path = manifest_path
         self.transition_indices = transition_indices
         self.transition_segment_ids = transition_segment_ids.astype(np.int32)
         self.transition_task_ids = task_ids.astype(np.int32)
+        self.segment_goal_indices = segment_goal_indices
         self.size = len(transition_indices)
 
         task_values, task_counts = np.unique(self.transition_task_ids, return_counts=True)
@@ -577,6 +659,7 @@ class _AtomicSegmentDataset(GCDataset):
         )
         self.manifest_summary = {
             'path': str(manifest_path),
+            'manifest_sha256': _file_sha256(manifest_path),
             'raw_dataset_size': int(self.raw_size),
             'num_transitions': int(self.size),
             'num_segments': int(len(used_segment_ids)),
@@ -587,7 +670,7 @@ class _AtomicSegmentDataset(GCDataset):
             },
         }
 
-    def _sample_atomic(self, batch_size, idxs=None, evaluation=False):
+    def _sample_atomic(self, batch_size, idxs=None, evaluation=False, augment_keys=None):
         """Sample transitions and their internal language-task labels."""
         if idxs is None:
             idxs = np.random.randint(self.size, size=batch_size)
@@ -601,11 +684,11 @@ class _AtomicSegmentDataset(GCDataset):
             batch['observations'] = self.get_observations(raw_idxs)
             batch['next_observations'] = self.get_observations(raw_idxs + 1)
 
-        if self.config['p_aug'] is not None and not evaluation:
+        if augment_keys and self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
-                self.augment(batch, ['observations', 'next_observations'])
+                self.augment(batch, list(augment_keys))
 
-        return batch, self.transition_task_ids[idxs]
+        return batch, self.transition_task_ids[idxs], idxs
 
 
 @dataclasses.dataclass
@@ -617,15 +700,75 @@ class AtomicLanguageDataset(_AtomicSegmentDataset):
         mode = str(self.config.get('language_dataset_mode', 'atomic_movement'))
         if mode != 'atomic_movement':
             raise ValueError("AtomicLanguageDataset requires language_dataset_mode='atomic_movement'.")
+        num_language_tasks = int(self.config['num_language_tasks'])
+        if np.any(self.transition_task_ids < 1) or np.any(
+            self.transition_task_ids > num_language_tasks
+        ):
+            raise ValueError(f'Atomic task IDs must be in [1, {num_language_tasks}].')
         _initialize_language_conditioning(self)
 
     def sample(self, batch_size, idxs=None, evaluation=False):
-        batch, task_ids = self._sample_atomic(batch_size, idxs=idxs, evaluation=evaluation)
+        batch, task_ids, _ = self._sample_atomic(
+            batch_size,
+            idxs=idxs,
+            evaluation=evaluation,
+            augment_keys=('observations', 'next_observations'),
+        )
         return _attach_language_condition(self, batch, task_ids, evaluation)
 
     def get_and_reset_diagnostics(self):
         """Report the task and paraphrase mixture actually seen by training."""
         return _get_and_reset_language_diagnostics(self)
+
+
+@dataclasses.dataclass
+class AtomicGCDataset(_AtomicSegmentDataset):
+    """Atomic Cube conditioned on their endpoint image (not in an episode but in a pick-place task)"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.segment_goal_indices is None:
+            raise ValueError('AtomicGCDataset requires goal_index in its atomic manifest.')
+        self.atomic_goal_stack_mode = str(
+            self.config.get('atomic_goal_stack_mode', 'repeat_endpoint')
+        )
+        if self.atomic_goal_stack_mode != 'repeat_endpoint':
+            raise ValueError(
+                "AtomicGCDataset currently requires atomic_goal_stack_mode='repeat_endpoint'."
+            )
+        self.manifest_summary['atomic_goal_stack_mode'] = self.atomic_goal_stack_mode
+
+    def _get_endpoint_goals(self, goal_idxs):
+        # Return endpoint images.
+        
+        goals = jax.tree_util.tree_map(
+            lambda arr: arr[goal_idxs], self.dataset['observations']
+        )
+        frame_stack = self.config['frame_stack']
+        if frame_stack is not None:
+            goals = jax.tree_util.tree_map(
+                lambda arr: np.concatenate([arr] * int(frame_stack), axis=-1), goals
+            )
+        return goals
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        batch, _, atomic_idxs = self._sample_atomic(
+            batch_size,
+            idxs=idxs,
+            evaluation=evaluation,
+            augment_keys=None,
+        )
+        segment_ids = self.transition_segment_ids[atomic_idxs]
+        goal_idxs = self.segment_goal_indices[segment_ids]
+        batch['actor_goals'] = self._get_endpoint_goals(goal_idxs)
+
+        if self.config['p_aug'] is not None and not evaluation:
+            if np.random.rand() < self.config['p_aug']:
+                self.augment(
+                    batch,
+                    ['observations', 'next_observations', 'actor_goals'],
+                )
+        return batch
 
 
 def _actions_valids_fingerprint(dataset):

@@ -18,6 +18,7 @@ from absl import app, flags
 from agents import agents
 from ml_collections import config_flags
 from utils.datasets import (
+    AtomicGCDataset,
     AtomicLanguageDataset,
     Dataset,
     EndpointLanguageDataset,
@@ -231,6 +232,7 @@ def _goal_sampling_summary(config):
         'num_language_tasks',
         'atomic_train_manifest_path',
         'atomic_val_manifest_path',
+        'atomic_goal_stack_mode',
         'future_language_train_labels_path',
         'future_language_val_labels_path',
         'language_embedding_path',
@@ -373,6 +375,7 @@ def main(_):
     )
 
     dataset_class = {
+        'AtomicGCDataset': AtomicGCDataset,
         'AtomicLanguageDataset': AtomicLanguageDataset,
         'EndpointLanguageDataset': EndpointLanguageDataset,
         'FutureGoalImageLanguageDataset': FutureGoalImageLanguageDataset,
@@ -386,7 +389,7 @@ def main(_):
     }[config['dataset_class']]
     # set up training dataset with arguments
     train_dataset_kwargs = {}
-    if dataset_class is AtomicLanguageDataset:
+    if dataset_class in {AtomicGCDataset, AtomicLanguageDataset}:
         train_dataset_kwargs['manifest_path'] = config['atomic_train_manifest_path']
     elif dataset_class is EndpointLanguageDataset:
         train_dataset_kwargs['manifest_path'] = config['endpoint_train_manifest_path']
@@ -409,7 +412,7 @@ def main(_):
         val_dataset_class = GCDataset if config['dataset_class'] in stitch_dataset_classes else dataset_class
         # set up validation dataset with arguments
         val_dataset_kwargs = {}
-        if val_dataset_class is AtomicLanguageDataset:
+        if val_dataset_class in {AtomicGCDataset, AtomicLanguageDataset}:
             val_dataset_kwargs['manifest_path'] = config['atomic_val_manifest_path']
         elif val_dataset_class is EndpointLanguageDataset:
             val_dataset_kwargs['manifest_path'] = config['endpoint_val_manifest_path']
