@@ -233,6 +233,7 @@ def _goal_sampling_summary(config):
         'atomic_train_manifest_path',
         'atomic_val_manifest_path',
         'atomic_goal_stack_mode',
+        'atomic_require_source_fingerprint',
         'future_language_train_labels_path',
         'future_language_val_labels_path',
         'language_embedding_path',
@@ -391,6 +392,11 @@ def main(_):
     train_dataset_kwargs = {}
     if dataset_class in {AtomicGCDataset, AtomicLanguageDataset}:
         train_dataset_kwargs['manifest_path'] = config['atomic_train_manifest_path']
+        train_dataset_kwargs['source_dataset_name'] = FLAGS.env_name
+        train_dataset_kwargs['source_split'] = 'train'
+        dataset_dir = os.environ.get('OGBENCH_DATASET_DIR') or os.environ.get('OGBENCH_DATA_DIR')
+        if dataset_dir:
+            train_dataset_kwargs['source_path'] = os.path.join(dataset_dir, f'{FLAGS.env_name}.npz')
     elif dataset_class is EndpointLanguageDataset:
         train_dataset_kwargs['manifest_path'] = config['endpoint_train_manifest_path']
         dataset_dir = os.environ.get('OGBENCH_DATASET_DIR') or os.environ.get('OGBENCH_DATA_DIR')
@@ -414,6 +420,13 @@ def main(_):
         val_dataset_kwargs = {}
         if val_dataset_class in {AtomicGCDataset, AtomicLanguageDataset}:
             val_dataset_kwargs['manifest_path'] = config['atomic_val_manifest_path']
+            val_dataset_kwargs['source_dataset_name'] = FLAGS.env_name
+            val_dataset_kwargs['source_split'] = 'val'
+            dataset_dir = os.environ.get('OGBENCH_DATASET_DIR') or os.environ.get('OGBENCH_DATA_DIR')
+            if dataset_dir:
+                val_dataset_kwargs['source_path'] = os.path.join(
+                    dataset_dir, f'{FLAGS.env_name}-val.npz'
+                )
         elif val_dataset_class is EndpointLanguageDataset:
             val_dataset_kwargs['manifest_path'] = config['endpoint_val_manifest_path']
             dataset_dir = os.environ.get('OGBENCH_DATASET_DIR') or os.environ.get('OGBENCH_DATA_DIR')

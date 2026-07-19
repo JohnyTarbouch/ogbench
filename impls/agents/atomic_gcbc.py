@@ -17,6 +17,7 @@ def get_config():
                 atomic_train_manifest_path='',
                 atomic_val_manifest_path='',
                 atomic_goal_stack_mode='repeat_endpoint',
+                atomic_require_source_fingerprint=False,
             )
         )
     )

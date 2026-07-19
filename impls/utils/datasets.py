@@ -513,6 +513,9 @@ class _AtomicSegmentDataset(GCDataset):
     # every raw frame would need tens of gigabytes without changing a batch.
     preprocess_frame_stack: bool = False
     manifest_path: Optional[Union[str, Path]] = None
+    source_dataset_name: Optional[str] = None
+    source_split: Optional[str] = None
+    source_path: Optional[Union[str, Path]] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -529,6 +532,31 @@ class _AtomicSegmentDataset(GCDataset):
             missing = required.difference(manifest.files)
             if missing:
                 raise ValueError(f'Atomic segment manifest is missing keys: {sorted(missing)}')
+            require_source_fingerprint = bool(
+                self.config.get('atomic_require_source_fingerprint', False)
+            )
+            provenance_keys = {
+                'schema_version',
+                'source_dataset_name',
+                'source_split',
+                'source_num_states',
+                'source_num_valid_transitions',
+                'source_num_episodes',
+                'source_file_sha256',
+                'source_actions_valids_sha256',
+            }
+            if require_source_fingerprint:
+                missing_provenance = provenance_keys.difference(manifest.files)
+                if missing_provenance:
+                    raise ValueError(
+                        'Atomic manifest source provenance is required but missing keys: '
+                        f'{sorted(missing_provenance)}'
+                    )
+            provenance = {
+                key: np.asarray(manifest[key])
+                for key in provenance_keys
+                if key in manifest.files
+            }
             transition_indices = np.asarray(manifest['transition_indices'], dtype=np.int64)
             transition_segment_ids = np.asarray(manifest['transition_segment_ids'], dtype=np.int64)
             segment_task_ids = np.asarray(manifest['task_id'], dtype=np.int64)
@@ -557,6 +585,63 @@ class _AtomicSegmentDataset(GCDataset):
                 if 'num_transitions' in manifest.files
                 else None
             )
+
+        def provenance_scalar(key, cast):
+            value = provenance[key]
+            if value.shape != ():
+                raise ValueError(f'Atomic manifest provenance key {key!r} must be scalar.')
+            return cast(value.item())
+
+        if require_source_fingerprint:
+            if self.source_dataset_name is None or self.source_split is None:
+                raise ValueError(
+                    'Atomic source fingerprint validation requires the expected '
+                    'source_dataset_name and source_split.'
+                )
+            if 'valids' not in self.dataset:
+                raise ValueError('Atomic source fingerprint validation requires compact valids.')
+            if provenance_scalar('schema_version', int) != 1:
+                raise ValueError('Unsupported atomic manifest provenance schema version.')
+            if provenance_scalar('source_dataset_name', str) != self.source_dataset_name:
+                raise ValueError(
+                    'Atomic manifest source dataset name does not match the requested dataset.'
+                )
+            if provenance_scalar('source_split', str) != self.source_split:
+                raise ValueError('Atomic manifest source split does not match the requested split.')
+            source_file_sha256 = provenance_scalar('source_file_sha256', str)
+            if len(source_file_sha256) != 64 or any(
+                character not in '0123456789abcdef' for character in source_file_sha256
+            ):
+                raise ValueError('Atomic manifest source file SHA-256 is malformed.')
+            if self.source_path is None:
+                raise ValueError(
+                    'Atomic source fingerprint validation requires source_path for '
+                    'archive checksum verification.'
+                )
+            source_path = Path(self.source_path).expanduser().resolve()
+            if not source_path.is_file():
+                raise FileNotFoundError(f'Atomic source archive not found: {source_path}')
+            if _file_sha256(source_path) != source_file_sha256:
+                raise ValueError(
+                    'Atomic manifest source archive checksum does not match the dataset file.'
+                )
+            if provenance_scalar('source_num_states', int) != self.raw_size:
+                raise ValueError('Atomic manifest source state count does not match the dataset.')
+            raw_valids = np.asarray(self.dataset['valids'])
+            if provenance_scalar('source_num_valid_transitions', int) != int(
+                np.sum(raw_valids > 0)
+            ):
+                raise ValueError(
+                    'Atomic manifest source valid-transition count does not match the dataset.'
+                )
+            source_num_episodes = int(np.sum(raw_valids <= 0))
+            if provenance_scalar('source_num_episodes', int) != source_num_episodes:
+                raise ValueError('Atomic manifest source episode count does not match the dataset.')
+            expected_fingerprint = _actions_valids_fingerprint(self.dataset)
+            if provenance_scalar('source_actions_valids_sha256', str) != expected_fingerprint:
+                raise ValueError(
+                    'Atomic manifest source actions/valids fingerprint does not match the dataset.'
+                )
 
         if transition_indices.ndim != 1 or transition_segment_ids.ndim != 1:
             raise ValueError('Atomic manifest transition arrays must be one-dimensional.')
@@ -669,6 +754,22 @@ class _AtomicSegmentDataset(GCDataset):
                 for task_id, count in zip(task_values, task_counts)
             },
         }
+        if provenance_keys.issubset(provenance):
+            self.manifest_summary.update(
+                {
+                    'schema_version': provenance_scalar('schema_version', int),
+                    'source_dataset_name': provenance_scalar('source_dataset_name', str),
+                    'source_split': provenance_scalar('source_split', str),
+                    'source_file_sha256': provenance_scalar('source_file_sha256', str),
+                    'source_archive_path': str(source_path) if require_source_fingerprint else None,
+                    'source_actions_valids_sha256': provenance_scalar(
+                        'source_actions_valids_sha256', str
+                    ),
+                    'source_fingerprint_required': require_source_fingerprint,
+                    'source_fingerprint_verified': require_source_fingerprint,
+                    'source_archive_verified': require_source_fingerprint,
+                }
+            )
 
     def _sample_atomic(self, batch_size, idxs=None, evaluation=False, augment_keys=None):
         """Sample transitions and their internal language-task labels."""
