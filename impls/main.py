@@ -18,9 +18,11 @@ from absl import app, flags
 from agents import agents
 from ml_collections import config_flags
 from utils.datasets import (
+    AtomicBYOLDataset,
     AtomicGCDataset,
     AtomicLanguageDataset,
     Dataset,
+    EndpointGoalDataset,
     EndpointLanguageDataset,
     FutureGoalImageLanguageDataset,
     FutureGoalLanguageDataset,
@@ -234,6 +236,9 @@ def _goal_sampling_summary(config):
         'atomic_val_manifest_path',
         'atomic_goal_stack_mode',
         'atomic_require_source_fingerprint',
+        'reference_repository',
+        'reference_commit',
+        'reference_agent_sha256',
         'future_language_train_labels_path',
         'future_language_val_labels_path',
         'language_embedding_path',
@@ -376,8 +381,10 @@ def main(_):
     )
 
     dataset_class = {
+        'AtomicBYOLDataset': AtomicBYOLDataset,
         'AtomicGCDataset': AtomicGCDataset,
         'AtomicLanguageDataset': AtomicLanguageDataset,
+        'EndpointGoalDataset': EndpointGoalDataset,
         'EndpointLanguageDataset': EndpointLanguageDataset,
         'FutureGoalImageLanguageDataset': FutureGoalImageLanguageDataset,
         'FutureGoalLanguageDataset': FutureGoalLanguageDataset,
@@ -390,14 +397,14 @@ def main(_):
     }[config['dataset_class']]
     # set up training dataset with arguments
     train_dataset_kwargs = {}
-    if dataset_class in {AtomicGCDataset, AtomicLanguageDataset}:
+    if dataset_class in {AtomicBYOLDataset, AtomicGCDataset, AtomicLanguageDataset}:
         train_dataset_kwargs['manifest_path'] = config['atomic_train_manifest_path']
         train_dataset_kwargs['source_dataset_name'] = FLAGS.env_name
         train_dataset_kwargs['source_split'] = 'train'
         dataset_dir = os.environ.get('OGBENCH_DATASET_DIR') or os.environ.get('OGBENCH_DATA_DIR')
         if dataset_dir:
             train_dataset_kwargs['source_path'] = os.path.join(dataset_dir, f'{FLAGS.env_name}.npz')
-    elif dataset_class is EndpointLanguageDataset:
+    elif dataset_class in {EndpointGoalDataset, EndpointLanguageDataset}:
         train_dataset_kwargs['manifest_path'] = config['endpoint_train_manifest_path']
         dataset_dir = os.environ.get('OGBENCH_DATASET_DIR') or os.environ.get('OGBENCH_DATA_DIR')
         if dataset_dir:
@@ -418,7 +425,11 @@ def main(_):
         val_dataset_class = GCDataset if config['dataset_class'] in stitch_dataset_classes else dataset_class
         # set up validation dataset with arguments
         val_dataset_kwargs = {}
-        if val_dataset_class in {AtomicGCDataset, AtomicLanguageDataset}:
+        if val_dataset_class in {
+            AtomicBYOLDataset,
+            AtomicGCDataset,
+            AtomicLanguageDataset,
+        }:
             val_dataset_kwargs['manifest_path'] = config['atomic_val_manifest_path']
             val_dataset_kwargs['source_dataset_name'] = FLAGS.env_name
             val_dataset_kwargs['source_split'] = 'val'
@@ -427,7 +438,7 @@ def main(_):
                 val_dataset_kwargs['source_path'] = os.path.join(
                     dataset_dir, f'{FLAGS.env_name}-val.npz'
                 )
-        elif val_dataset_class is EndpointLanguageDataset:
+        elif val_dataset_class in {EndpointGoalDataset, EndpointLanguageDataset}:
             val_dataset_kwargs['manifest_path'] = config['endpoint_val_manifest_path']
             dataset_dir = os.environ.get('OGBENCH_DATASET_DIR') or os.environ.get('OGBENCH_DATA_DIR')
             if dataset_dir:
@@ -468,13 +479,25 @@ def main(_):
         # Fill with the maximum action to let the agent know the action space size.
         example_batch['actions'] = np.full_like(example_batch['actions'], env.action_space.n - 1)
 
-    agent_class = agents[config['agent_name']]
+    if config['agent_name'] == 'byol_gamma':
+        from agents.byol import BYOLAgent
+
+        agent_class = BYOLAgent
+    else:
+        agent_class = agents[config['agent_name']]
     agent = agent_class.create(
         FLAGS.seed,
         example_batch['observations'],
         example_batch['actions'],
         config,
     )
+    if config['agent_name'] == 'byol_gamma':
+        from agents.byol import get_reference_provenance
+
+        _write_json(
+            os.path.join(FLAGS.save_dir, 'byol_reference.json'),
+            get_reference_provenance(),
+        )
     if 'representation_type' in agent.config:
         _write_json(
             os.path.join(FLAGS.save_dir, 'representation_transfer.json'),
@@ -527,6 +550,8 @@ def main(_):
             # Update agent.
             batch = train_dataset.sample(config['batch_size'])
             agent, update_info = agent.update(batch)
+            update_info = dict(update_info)
+            update_info.pop('stats', None)
 
         # Log metrics.
         if not FLAGS.eval_only and i % FLAGS.log_interval == 0:
@@ -534,6 +559,8 @@ def main(_):
             if val_dataset is not None:
                 val_batch = val_dataset.sample(config['batch_size'], evaluation=True)
                 _, val_info = agent.total_loss(val_batch, grad_params=None)
+                val_info = dict(val_info)
+                val_info.pop('stats', None)
                 train_metrics.update({f'validation/{k}': v for k, v in val_info.items()})
             if hasattr(train_dataset, 'get_and_reset_diagnostics'):
                 train_metrics.update(train_dataset.get_and_reset_diagnostics())

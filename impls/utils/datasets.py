@@ -872,6 +872,105 @@ class AtomicGCDataset(_AtomicSegmentDataset):
         return batch
 
 
+@dataclasses.dataclass
+class AtomicBYOLDataset(AtomicGCDataset):
+    """
+    Atomic GCBC samples with a geometric within-movement BYOL target.
+    The BC actor receives exactly the same fixed stable endpoint.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.config['frame_stack'] is not None:
+            raise ValueError(
+                'AtomicBYOLDataset is currently state-only and requires frame_stack=None.'
+            )
+        discount = float(self.config['discount'])
+        if not 0.0 <= discount < 1.0:
+            raise ValueError('AtomicBYOLDataset discount must lie in [0, 1).')
+        if not bool(self.config['value_geom_sample']):
+            raise ValueError('AtomicBYOLDataset requires value_geom_sample=True.')
+
+        split_id = {'train': 0, 'val': 1}.get(self.source_split, 2)
+        run_seed = int(self.config.get('run_seed', 0))
+        self._byol_value_rng = np.random.default_rng(
+            np.random.SeedSequence([run_seed, 0xB10A, split_id])
+        )
+        self._byol_sample_count = 0
+        self._byol_requested_offset_sum = 0
+        self._byol_effective_offset_sum = 0
+        self._byol_endpoint_count = 0
+        self.manifest_summary.update(
+            {
+                'byol_value_goal_sampling': 'clipped_geometric_within_atomic_segment',
+                'byol_discount': discount,
+                'byol_rng_seed': run_seed,
+                'byol_state_only': True,
+            }
+        )
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        batch, _, atomic_idxs = self._sample_atomic(
+            batch_size,
+            idxs=idxs,
+            evaluation=evaluation,
+            augment_keys=None,
+        )
+        raw_idxs = self.transition_indices[atomic_idxs]
+        segment_ids = self.transition_segment_ids[atomic_idxs]
+        endpoint_idxs = self.segment_goal_indices[segment_ids]
+
+        requested_offsets = self._byol_value_rng.geometric(
+            p=1.0 - float(self.config['discount']),
+            size=len(raw_idxs),
+        )
+        value_goal_idxs = np.minimum(raw_idxs + requested_offsets, endpoint_idxs)
+        if np.any(value_goal_idxs <= raw_idxs) or np.any(value_goal_idxs > endpoint_idxs):
+            raise RuntimeError('Atomic BYOL target escaped its declared segment bounds.')
+
+        batch['value_goals'] = self.get_observations(value_goal_idxs)
+        batch['actor_goals'] = self._get_endpoint_goals(endpoint_idxs)
+        successes = (raw_idxs == value_goal_idxs).astype(float)
+        batch['masks'] = 1.0 - successes
+        batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
+
+        if not evaluation:
+            effective_offsets = value_goal_idxs - raw_idxs
+            self._byol_sample_count += len(raw_idxs)
+            self._byol_requested_offset_sum += int(np.sum(requested_offsets))
+            self._byol_effective_offset_sum += int(np.sum(effective_offsets))
+            self._byol_endpoint_count += int(np.sum(value_goal_idxs == endpoint_idxs))
+
+        if self.config['p_aug'] is not None and not evaluation:
+            if np.random.rand() < self.config['p_aug']:
+                self.augment(
+                    batch,
+                    ['observations', 'next_observations', 'value_goals', 'actor_goals'],
+                )
+        return batch
+
+    def get_and_reset_diagnostics(self):
+        count = self._byol_sample_count
+        metrics = {'data/atomic_byol_samples': float(count)}
+        if count:
+            metrics.update(
+                {
+                    'data/atomic_byol_requested_offset_mean': (
+                        self._byol_requested_offset_sum / count
+                    ),
+                    'data/atomic_byol_effective_offset_mean': (
+                        self._byol_effective_offset_sum / count
+                    ),
+                    'data/atomic_byol_endpoint_fraction': self._byol_endpoint_count / count,
+                }
+            )
+        self._byol_sample_count = 0
+        self._byol_requested_offset_sum = 0
+        self._byol_effective_offset_sum = 0
+        self._byol_endpoint_count = 0
+        return metrics
+
+
 def _actions_valids_fingerprint(dataset):
     digest = hashlib.sha256()
     for key in ('actions', 'valids'):
@@ -1145,6 +1244,67 @@ class _EndpointManifestDataset(GCDataset):
                 metrics[f'data/endpoint_task_{task_id}_fraction'] = float(count / total)
         self._endpoint_task_counts.fill(0)
         return metrics
+
+
+@dataclasses.dataclass
+class EndpointGoalDataset(_EndpointManifestDataset):
+    """
+    Transitions conditioned on their fixed achieved endpoint image.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        mode = str(self.config.get('endpoint_dataset_mode', 'stable_achieved_endpoint'))
+        if mode != 'stable_achieved_endpoint':
+            raise ValueError(
+                "EndpointGoalDataset requires "
+                "endpoint_dataset_mode='stable_achieved_endpoint'."
+            )
+        self.endpoint_goal_stack_mode = str(
+            self.config.get('endpoint_goal_stack_mode', 'repeat_endpoint')
+        )
+        if self.endpoint_goal_stack_mode != 'repeat_endpoint':
+            raise ValueError(
+                "EndpointGoalDataset requires "
+                "endpoint_goal_stack_mode='repeat_endpoint'."
+            )
+        self.endpoint_manifest_summary['endpoint_goal_stack_mode'] = (
+            self.endpoint_goal_stack_mode
+        )
+
+    def _get_endpoint_goals(self, goal_idxs):
+        goals = jax.tree_util.tree_map(
+            lambda arr: arr[goal_idxs], self.dataset['observations']
+        )
+        frame_stack = self.config['frame_stack']
+        if frame_stack is not None:
+            goals = jax.tree_util.tree_map(
+                lambda arr: np.concatenate([arr] * int(frame_stack), axis=-1),
+                goals,
+            )
+        return goals
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        batch, _, goal_idxs = self._sample_endpoint(
+            batch_size,
+            idxs=idxs,
+            evaluation=evaluation,
+        )
+        batch['actor_goals'] = self._get_endpoint_goals(goal_idxs)
+
+        if (
+            not evaluation
+            and self.config['p_aug'] is not None
+            and np.random.rand() < self.config['p_aug']
+        ):
+            self.augment(
+                batch,
+                ['observations', 'next_observations', 'actor_goals'],
+            )
+        return batch
+
+    def get_and_reset_diagnostics(self):
+        return self._get_and_reset_endpoint_diagnostics()
 
 
 @dataclasses.dataclass
