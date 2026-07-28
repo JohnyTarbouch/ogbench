@@ -23,6 +23,7 @@ from utils.datasets import (
     AtomicLanguageDataset,
     Dataset,
     EndpointGoalDataset,
+    EndpointInclusiveGCDataset,
     EndpointLanguageDataset,
     FutureGoalImageLanguageDataset,
     FutureGoalLanguageDataset,
@@ -384,7 +385,8 @@ def main(_):
         'AtomicBYOLDataset': AtomicBYOLDataset,
         'AtomicGCDataset': AtomicGCDataset,
         'AtomicLanguageDataset': AtomicLanguageDataset,
-        'EndpointGoalDataset': EndpointGoalDataset,
+        'EndpointGoalDataset': EndpointGoalDataset, # sample within an atomic episode (exclude final img)
+        'EndpointInclusiveGCDataset': EndpointInclusiveGCDataset, # enable sampling final img
         'EndpointLanguageDataset': EndpointLanguageDataset,
         'FutureGoalImageLanguageDataset': FutureGoalImageLanguageDataset,
         'FutureGoalLanguageDataset': FutureGoalLanguageDataset,

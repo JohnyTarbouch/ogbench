@@ -333,7 +333,7 @@ class GCDataset:
         random_goal_idxs = self.dataset.get_random_idxs(batch_size)
 
         # Goals from the same trajectory (excluding the current state, unless it is the final state).
-        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        final_state_idxs = self.get_trajectory_goal_final_state_idxs(idxs)
         if geom_sample:
             # Geometric sampling.
             offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)  # in [1, inf)
@@ -355,6 +355,12 @@ class GCDataset:
             goal_idxs = np.where(np.random.rand(batch_size) < p_curgoal, idxs, goal_idxs)
 
         return goal_idxs
+
+    def get_trajectory_goal_final_state_idxs(self, idxs):
+        """Include final state ( image) as goal."""
+        return self.terminal_locs[
+            np.searchsorted(self.terminal_locs, idxs)
+        ]
 
     def augment(self, batch, keys):
         """Apply image augmentation to the given keys."""
@@ -390,6 +396,32 @@ class GCDataset:
             cur_idxs = np.maximum(idxs - i, initial_state_idxs)
             rets.append(jax.tree_util.tree_map(lambda arr: arr[cur_idxs], self.dataset['observations']))
         return jax.tree_util.tree_map(lambda *args: np.concatenate(args, axis=-1), *rets)
+
+
+@dataclasses.dataclass
+class EndpointInclusiveGCDataset(GCDataset):
+    """
+    Sample future goals through the trajectory endpoint.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        if 'valids' not in self.dataset:
+            raise ValueError(
+                'EndpointInclusiveGCDataset requires compact data with action-free endpoints.'
+            )
+        self.action_free_endpoint_locs = np.flatnonzero(self.dataset['valids'] == 0)
+        if len(self.action_free_endpoint_locs) == 0:
+            raise ValueError('No action-free trajectory endpoints were found.')
+
+    def get_trajectory_goal_final_state_idxs(self, idxs):
+        positions = np.searchsorted(
+            self.action_free_endpoint_locs, 
+            idxs
+        )
+        if np.any(positions >= len(self.action_free_endpoint_locs)):
+            raise ValueError('A sampled current state lies after the final trajectory endpoint.')
+        return self.action_free_endpoint_locs[positions]
 
 
 def _initialize_language_conditioning(owner):
