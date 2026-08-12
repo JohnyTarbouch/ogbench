@@ -7,6 +7,7 @@ import numpy as np
 
 
 SUPPORTED_LANGUAGE_EVAL_VARIANTS = ('canonical', 'heldout', 'zero', 'shuffled')
+LANGUAGE_SHUFFLE_SALT = 0x4C534846  # ASCII "LSHF".
 
 
 @lru_cache(maxsize=8)
@@ -31,12 +32,25 @@ def load_language_cache(path, num_tasks, embedding_dim):
         cache = {key: np.asarray(data[key]) for key in required}
         cache['model_name'] = str(data['model_name']) if 'model_name' in data.files else 'unknown'
         cache['normalized'] = bool(data['normalized']) if 'normalized' in data.files else False
-        if 'task_ij' in data.files:
-            cache['task_ij'] = np.asarray(data['task_ij'], dtype=np.int32)
-        if 'task_spec_sha256' in data.files:
-            cache['task_spec_sha256'] = str(data['task_spec_sha256'])
-        if 'pooling' in data.files:
-            cache['pooling'] = str(data['pooling'])
+        scalar_optional = (
+            'cache_schema_version',
+            'task_spec_sha256',
+            'pooling',
+            'model_revision',
+            'retrieval_reference',
+        )
+        for key in scalar_optional:
+            if key in data.files:
+                value = np.asarray(data[key])
+                if value.shape != ():
+                    raise ValueError(f'Language cache scalar {key!r} must have shape ().')
+                cache[key] = value.item()
+        for key in ('task_ij', 'task_coarse_ij', 'task_local_ij'):
+            if key in data.files:
+                cache[key] = np.asarray(data[key], dtype=np.int32)
+        for key in ('grid_world_x_edges', 'grid_world_y_edges'):
+            if key in data.files:
+                cache[key] = np.asarray(data[key], dtype=np.float32)
         for split in ('train', 'heldout'):
             key = f'{split}_nearest_task_ids'
             if key in data.files:
@@ -69,6 +83,26 @@ def load_language_cache(path, num_tasks, embedding_dim):
             raise ValueError(f"task_ij has shape {cache['task_ij'].shape}; expected {(num_tasks, 2)}.")
         if len(np.unique(cache['task_ij'], axis=0)) != num_tasks:
             raise ValueError('task_ij must contain one unique cell per language task.')
+    for key in ('task_coarse_ij', 'task_local_ij'):
+        if key in cache and cache[key].shape != (num_tasks, 2):
+            raise ValueError(f"{key} has shape {cache[key].shape}; expected {(num_tasks, 2)}.")
+
+    grid_keys = ('grid_world_x_edges', 'grid_world_y_edges')
+    if any(key in cache for key in grid_keys):
+        if not all(key in cache for key in grid_keys) or 'task_ij' not in cache:
+            raise ValueError('Language grid edges and task_ij must be provided together.')
+        for key in grid_keys:
+            edges = cache[key]
+            if edges.ndim != 1 or len(edges) < 2 or np.any(np.diff(edges) <= 0):
+                raise ValueError(f'{key} must be a strictly increasing one-dimensional array.')
+        expected_shape = (
+            len(cache['grid_world_x_edges']) - 1,
+            len(cache['grid_world_y_edges']) - 1,
+        )
+        if np.any(cache['task_ij'] < 0) or np.any(
+            cache['task_ij'] >= np.asarray(expected_shape, dtype=np.int32)
+        ):
+            raise ValueError(f'task_ij contains cells outside language grid shape {expected_shape}.')
 
     for key in ('canonical_embeddings', 'train_embeddings', 'heldout_embeddings'):
         embeddings = np.asarray(cache[key], dtype=np.float32)
@@ -117,6 +151,39 @@ def language_task_id_for_goal(cache, goal_ij, fallback_task_id=None):
     return int(matches[0] + 1)
 
 
+def language_task_id_for_goal_xyz(cache, goal_xyz, fallback_task_id=None):
+    """Map a Cube goal coordinate to the unique cached language-grid task."""
+    grid_keys = ('grid_world_x_edges', 'grid_world_y_edges')
+    if 'task_ij' not in cache or not all(key in cache for key in grid_keys):
+        if fallback_task_id is None:
+            raise ValueError(
+                'Language cache has no coordinate grid and no fallback task ID was supplied.'
+            )
+        return int(fallback_task_id)
+
+
+    grid_dtype = np.result_type(
+        cache['grid_world_x_edges'].dtype,
+        cache['grid_world_y_edges'].dtype,
+    )
+    goal_xyz = np.asarray(goal_xyz, dtype=grid_dtype)
+    if goal_xyz.shape != (3,) or not np.all(np.isfinite(goal_xyz)):
+        raise ValueError(f'Cube goal_xyz must have shape (3,), got {goal_xyz.shape}.')
+    x_edges = np.asarray(cache['grid_world_x_edges'], dtype=grid_dtype)
+    y_edges = np.asarray(cache['grid_world_y_edges'], dtype=grid_dtype)
+    x, y = map(float, goal_xyz[:2])
+    if not (x_edges[0] <= x <= x_edges[-1] and y_edges[0] <= y <= y_edges[-1]):
+        raise ValueError(f'Cube goal {goal_xyz.tolist()} lies outside the language grid.')
+    row = int(np.searchsorted(x_edges[1:-1], x, side='right'))
+    column = int(np.searchsorted(y_edges[1:-1], y, side='right'))
+    matches = np.flatnonzero(np.all(cache['task_ij'] == (row, column), axis=1))
+    if len(matches) != 1:
+        raise ValueError(
+            f'Language grid cell {(row, column)} is absent or duplicated in the cache.'
+        )
+    return int(matches[0] + 1)
+
+
 def _validate_evaluation_request(cache, task_id, variant, episode_index):
     if task_id < 1 or task_id > len(cache['task_ids']):
         raise ValueError(f'Language task ID {task_id} is out of range.')
@@ -124,6 +191,21 @@ def _validate_evaluation_request(cache, task_id, variant, episode_index):
         raise ValueError(f'Unsupported language evaluation variant: {variant!r}')
     if episode_index < 0:
         raise ValueError('Language evaluation episode_index must be nonnegative.')
+
+
+@lru_cache(maxsize=1024)
+def _shuffled_wrong_task_ids(task_id, num_tasks):
+    """return one reproducible, unbiased ordering of every wrong task ID."""
+    if not (1 <= task_id <= num_tasks):
+        raise ValueError(f'Language task ID {task_id} is out of range.')
+    candidates = np.arange(1, num_tasks + 1, dtype=np.int32)
+    candidates = candidates[candidates != task_id]
+    seed = np.random.SeedSequence(
+        [int(task_id), int(num_tasks), int(LANGUAGE_SHUFFLE_SALT)]
+    )
+    shuffled = np.random.default_rng(seed).permutation(candidates)
+    shuffled.setflags(write=False)
+    return shuffled
 
 
 def evaluation_language_condition_task_id(cache, task_id, variant, episode_index):
@@ -138,8 +220,8 @@ def evaluation_language_condition_task_id(cache, task_id, variant, episode_index
     num_tasks = len(cache['task_ids'])
     if num_tasks < 2:
         raise ValueError('Shuffled-language evaluation requires at least two tasks.')
-    offset = episode_index % (num_tasks - 1) + 1
-    return int((task_id - 1 + offset) % num_tasks + 1)
+    wrong_task_ids = _shuffled_wrong_task_ids(int(task_id), int(num_tasks))
+    return int(wrong_task_ids[episode_index % len(wrong_task_ids)])
 
 
 def evaluation_language_condition(cache, task_id, variant, episode_index):

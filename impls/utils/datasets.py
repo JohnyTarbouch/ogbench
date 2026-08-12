@@ -416,7 +416,7 @@ class EndpointInclusiveGCDataset(GCDataset):
 
     def get_trajectory_goal_final_state_idxs(self, idxs):
         positions = np.searchsorted(
-            self.action_free_endpoint_locs, 
+            self.action_free_endpoint_locs,
             idxs
         )
         if np.any(positions >= len(self.action_free_endpoint_locs)):
@@ -492,7 +492,7 @@ def _attach_language_condition(owner, batch, task_ids, evaluation):
     if np.any(task_ids < 1) or np.any(task_ids > num_tasks):
         raise ValueError(f'Language task IDs must be in [1, {num_tasks}].')
     task_rows = task_ids - 1
-    
+
     if owner.language_train_control == 'zero':
         embeddings = np.zeros(
             (len(task_rows), int(owner.config['language_embedding_dim'])),
@@ -558,6 +558,15 @@ class _AtomicSegmentDataset(GCDataset):
         manifest_path = Path(self.manifest_path).expanduser().resolve()
         if not manifest_path.is_file():
             raise FileNotFoundError(f'Atomic segment manifest not found: {manifest_path}')
+        manifest_sha256 = _file_sha256(manifest_path)
+        split = str(self.source_split or '')
+        expected_manifest_sha256 = str(
+            self.config.get(f'atomic_{split}_manifest_sha256', '') or ''
+        )
+        if expected_manifest_sha256 and manifest_sha256 != expected_manifest_sha256:
+            raise ValueError(
+                f'Atomic {split} manifest SHA-256 does not match the configured artifact.'
+            )
 
         required = {'transition_indices', 'transition_segment_ids', 'task_id'}
         with np.load(manifest_path, allow_pickle=False) as manifest:
@@ -776,7 +785,7 @@ class _AtomicSegmentDataset(GCDataset):
         )
         self.manifest_summary = {
             'path': str(manifest_path),
-            'manifest_sha256': _file_sha256(manifest_path),
+            'manifest_sha256': manifest_sha256,
             'raw_dataset_size': int(self.raw_size),
             'num_transitions': int(self.size),
             'num_segments': int(len(used_segment_ids)),
@@ -839,6 +848,116 @@ class AtomicLanguageDataset(_AtomicSegmentDataset):
         ):
             raise ValueError(f'Atomic task IDs must be in [1, {num_language_tasks}].')
         _initialize_language_conditioning(self)
+        self._validate_language_contract()
+
+    def _validate_language_contract(self):
+        """Bind fine-language segment semantics to the exact frozen cache."""
+        required_contract = bool(
+            self.config.get('atomic_require_language_contract', False)
+        )
+        required = {
+            'language_contract_schema_version',
+            'task_ids',
+            'task_ij',
+            'task_coarse_ij',
+            'task_local_ij',
+            'task_instructions',
+            'task_spec_sha256',
+            'grid_world_x_edges',
+            'grid_world_y_edges',
+            'grid_row',
+            'grid_column',
+            'goal_outside_grid',
+        }
+        with np.load(self.manifest_path, allow_pickle=False) as manifest:
+            available = set(manifest.files)
+            if not required_contract and not required.issubset(available):
+                self.manifest_summary['language_contract_verified'] = False
+                return
+            missing = required.difference(available)
+            if missing:
+                raise ValueError(
+                    'Atomic language contract is required but the manifest is missing '
+                    f'{sorted(missing)}.'
+                )
+            contract_version = np.asarray(
+                manifest['language_contract_schema_version']
+            )
+            if contract_version.shape != () or int(contract_version.item()) != 1:
+                raise ValueError('Unsupported atomic language-contract schema version.')
+            manifest_task_ids = np.asarray(manifest['task_ids'], dtype=np.int32)
+            manifest_task_ij = np.asarray(manifest['task_ij'], dtype=np.int32)
+            manifest_coarse_ij = np.asarray(manifest['task_coarse_ij'], dtype=np.int32)
+            manifest_local_ij = np.asarray(manifest['task_local_ij'], dtype=np.int32)
+            manifest_instructions = np.asarray(manifest['task_instructions']).astype(str)
+            manifest_spec_sha = str(np.asarray(manifest['task_spec_sha256']).item())
+            manifest_x_edges = np.asarray(manifest['grid_world_x_edges'], dtype=np.float32)
+            manifest_y_edges = np.asarray(manifest['grid_world_y_edges'], dtype=np.float32)
+            segment_rows = np.asarray(manifest['grid_row'], dtype=np.int32)
+            segment_columns = np.asarray(manifest['grid_column'], dtype=np.int32)
+            outside = np.asarray(manifest['goal_outside_grid'], dtype=bool)
+
+        expected_ids = np.arange(1, int(self.config['num_language_tasks']) + 1, dtype=np.int32)
+        if not np.array_equal(manifest_task_ids, expected_ids):
+            raise ValueError('Atomic language manifest task IDs are not complete and consecutive.')
+        cache = self.language_cache
+        for key in (
+            'cache_schema_version',
+            'task_ij',
+            'task_coarse_ij',
+            'task_local_ij',
+            'task_spec_sha256',
+            'grid_world_x_edges',
+            'grid_world_y_edges',
+        ):
+            if key not in cache:
+                raise ValueError(f'Language cache is missing required contract key {key!r}.')
+        if int(cache['cache_schema_version']) != 1:
+            raise ValueError('Unsupported language-cache schema version.')
+        comparisons = {
+            'task_ij': (manifest_task_ij, cache['task_ij']),
+            'task_coarse_ij': (manifest_coarse_ij, cache['task_coarse_ij']),
+            'task_local_ij': (manifest_local_ij, cache['task_local_ij']),
+            'grid_world_x_edges': (manifest_x_edges, cache['grid_world_x_edges']),
+            'grid_world_y_edges': (manifest_y_edges, cache['grid_world_y_edges']),
+            'task_instructions': (manifest_instructions, cache['canonical_texts'].astype(str)),
+        }
+        for label, (manifest_value, cache_value) in comparisons.items():
+            if not np.array_equal(manifest_value, cache_value):
+                raise ValueError(f'Language cache {label} does not match the atomic manifest.')
+        if manifest_spec_sha != str(cache['task_spec_sha256']):
+            raise ValueError('Language cache task-spec fingerprint does not match the manifest.')
+        configured_spec_sha = str(
+            self.config.get('language_task_spec_sha256', '') or ''
+        )
+        if configured_spec_sha and manifest_spec_sha != configured_spec_sha:
+            raise ValueError('Language task-spec SHA-256 does not match the configured artifact.')
+        if np.any(outside):
+            raise ValueError('Strict atomic language manifest contains an out-of-grid endpoint.')
+        expected_cells = manifest_task_ij[
+            np.asarray(self.transition_task_ids, dtype=np.int64) - 1
+        ]
+        transition_cells = np.stack(
+            [
+                segment_rows[self.transition_segment_ids],
+                segment_columns[self.transition_segment_ids],
+            ],
+            axis=1,
+        )
+        if not np.array_equal(expected_cells, transition_cells):
+            raise ValueError('Atomic transition task IDs disagree with their fine-grid cells.')
+        self.manifest_summary.update(
+            {
+                'language_contract_verified': True,
+                'language_contract_schema_version': 1,
+                'task_spec_sha256': manifest_spec_sha,
+                'num_language_tasks': int(len(manifest_task_ids)),
+                'grid_shape': [
+                    int(len(manifest_x_edges) - 1),
+                    int(len(manifest_y_edges) - 1),
+                ],
+            }
+        )
 
     def sample(self, batch_size, idxs=None, evaluation=False):
         batch, task_ids, _ = self._sample_atomic(
@@ -852,6 +971,191 @@ class AtomicLanguageDataset(_AtomicSegmentDataset):
     def get_and_reset_diagnostics(self):
         """Report the task and paraphrase mixture actually seen by training."""
         return _get_and_reset_language_diagnostics(self)
+
+
+@dataclasses.dataclass
+class AtomicGoalLanguageDataset(AtomicLanguageDataset):
+    """Atomic Cube transitions conditioned on one shared endpoint image and text.
+
+    The endpoint image and language task are derived from the same manifest
+    segment.  This keeps the visual and language conditions exactly coupled
+    while preserving the transition/action distribution used by the existing
+    Atomic GCBC and Atomic LCBC datasets.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.segment_goal_indices is None:
+            raise ValueError('AtomicGoalLanguageDataset requires goal_index in its atomic manifest.')
+        self.atomic_goal_stack_mode = str(
+            self.config.get('atomic_goal_stack_mode', 'repeat_endpoint')
+        )
+        if self.atomic_goal_stack_mode != 'repeat_endpoint':
+            raise ValueError(
+                "AtomicGoalLanguageDataset currently requires "
+                "atomic_goal_stack_mode='repeat_endpoint'."
+            )
+        self.manifest_summary['atomic_goal_stack_mode'] = self.atomic_goal_stack_mode
+        self.manifest_summary['condition_coupling'] = 'same_segment_stable_endpoint_image_and_language'
+        self._validate_goal_language_coupling_contract()
+
+    def _validate_goal_language_coupling_contract(self):
+        """
+        Validate the Grid-15 endpoint-to-language metadata.
+        """
+        required_contract = bool(
+            self.config.get('atomic_require_goal_language_coupling', False)
+        )
+        required = {
+            'task_ids',
+            'task_grid_rows',
+            'task_grid_columns',
+            'task_instructions',
+            'task_index',
+            'task_id',
+            'grid_row',
+            'grid_column',
+            'goal_xyz',
+            'goal_outside_grid',
+            'grid_world_x_edges',
+            'grid_world_y_edges',
+        }
+        with np.load(self.manifest_path, allow_pickle=False) as manifest:
+            available = set(manifest.files)
+            if not required_contract and not required.issubset(available):
+                self.manifest_summary['goal_language_coupling_verified'] = False
+                return
+            missing = required.difference(available)
+            if missing:
+                raise ValueError(
+                    'Atomic goal-language coupling is required but the manifest '
+                    f'is missing {sorted(missing)}.'
+                )
+            task_ids = np.asarray(manifest['task_ids'], dtype=np.int32)
+            task_rows = np.asarray(manifest['task_grid_rows'], dtype=np.int32)
+            task_columns = np.asarray(manifest['task_grid_columns'], dtype=np.int32)
+            task_instructions = np.asarray(manifest['task_instructions']).astype(str)
+            segment_task_indices = np.asarray(manifest['task_index'], dtype=np.int32)
+            segment_task_ids = np.asarray(manifest['task_id'], dtype=np.int32)
+            segment_rows = np.asarray(manifest['grid_row'], dtype=np.int32)
+            segment_columns = np.asarray(manifest['grid_column'], dtype=np.int32)
+            goal_xyz = np.asarray(manifest['goal_xyz'], dtype=np.float32)
+            goal_outside = np.asarray(manifest['goal_outside_grid'], dtype=bool)
+            x_edges = np.asarray(manifest['grid_world_x_edges'], dtype=np.float32)
+            y_edges = np.asarray(manifest['grid_world_y_edges'], dtype=np.float32)
+
+        num_tasks = int(self.config['num_language_tasks'])
+        expected_task_ids = np.arange(1, num_tasks + 1, dtype=np.int32)
+        if not np.array_equal(task_ids, expected_task_ids):
+            raise ValueError('Atomic goal-language task IDs must be complete and consecutive.')
+        if not (
+            task_rows.shape
+            == task_columns.shape
+            == task_instructions.shape
+            == task_ids.shape
+        ):
+            raise ValueError('Atomic goal-language task metadata has inconsistent shapes.')
+        if np.any(np.diff(x_edges) <= 0) or np.any(np.diff(y_edges) <= 0):
+            raise ValueError('Atomic goal-language grid edges must be strictly increasing.')
+        expected_cells = {
+            (row, column)
+            for row in range(len(x_edges) - 1)
+            for column in range(len(y_edges) - 1)
+        }
+        if set(zip(task_rows.tolist(), task_columns.tolist())) != expected_cells:
+            raise ValueError('Atomic goal-language tasks must cover every Grid-15 cell once.')
+
+        num_segments = len(segment_task_ids)
+        segment_arrays = (
+            segment_task_indices,
+            segment_rows,
+            segment_columns,
+            goal_outside,
+        )
+        if any(array.shape != (num_segments,) for array in segment_arrays):
+            raise ValueError('Atomic goal-language segment metadata has inconsistent shapes.')
+        if goal_xyz.shape != (num_segments, 3):
+            raise ValueError('Atomic goal-language goal_xyz must have one XYZ row per segment.')
+        if np.any(segment_task_indices < 0) or np.any(segment_task_indices >= num_tasks):
+            raise ValueError('Atomic goal-language manifest has an invalid task_index.')
+        if not np.array_equal(task_ids[segment_task_indices], segment_task_ids):
+            raise ValueError('Atomic goal-language task_index and task_id disagree.')
+        if not np.array_equal(task_rows[segment_task_indices], segment_rows) or not np.array_equal(
+            task_columns[segment_task_indices], segment_columns
+        ):
+            raise ValueError('Atomic goal-language task IDs disagree with their grid cells.')
+
+        computed_rows = np.searchsorted(
+            x_edges[1:-1], goal_xyz[:, 0], side='right'
+        ).astype(np.int32)
+        computed_columns = np.searchsorted(
+            y_edges[1:-1], goal_xyz[:, 1], side='right'
+        ).astype(np.int32)
+        computed_rows = np.clip(computed_rows, 0, len(x_edges) - 2)
+        computed_columns = np.clip(computed_columns, 0, len(y_edges) - 2)
+        computed_outside = (
+            (goal_xyz[:, 0] < x_edges[0])
+            | (goal_xyz[:, 0] > x_edges[-1])
+            | (goal_xyz[:, 1] < y_edges[0])
+            | (goal_xyz[:, 1] > y_edges[-1])
+        )
+        if not np.array_equal(computed_rows, segment_rows) or not np.array_equal(
+            computed_columns, segment_columns
+        ):
+            raise ValueError('Atomic goal coordinates disagree with their stored Grid-15 cells.')
+        if not np.array_equal(computed_outside, goal_outside):
+            raise ValueError('Atomic goal outside-grid flags disagree with goal coordinates.')
+
+        cache_task_ids = np.asarray(self.language_cache['task_ids'], dtype=np.int32)
+        cache_texts = np.asarray(self.language_cache['canonical_texts']).astype(str)
+        if not np.array_equal(cache_task_ids, task_ids):
+            raise ValueError('Atomic goal-language cache task IDs disagree with the manifest.')
+        if not np.array_equal(cache_texts, task_instructions):
+            raise ValueError('Atomic goal-language cache instructions disagree with the manifest.')
+
+        self.manifest_summary.update(
+            {
+                'goal_language_coupling_verified': True,
+                'goal_language_grid_shape': [len(x_edges) - 1, len(y_edges) - 1],
+                'goal_language_outside_grid_segments': int(np.sum(goal_outside)),
+                'goal_language_outside_grid_transitions': int(
+                    np.sum(goal_outside[self.transition_segment_ids])
+                ),
+            }
+        )
+
+    def _get_endpoint_goals(self, goal_idxs):
+        goals = jax.tree_util.tree_map(
+            lambda arr: arr[goal_idxs], self.dataset['observations']
+        )
+        frame_stack = self.config['frame_stack']
+        if frame_stack is not None:
+            goals = jax.tree_util.tree_map(
+                lambda arr: np.concatenate([arr] * int(frame_stack), axis=-1), goals
+            )
+        return goals
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        # sample one, then derive both modalities from that transition exact atomic segment
+        batch, task_ids, atomic_idxs = self._sample_atomic(
+            batch_size,
+            idxs=idxs,
+            evaluation=evaluation,
+            augment_keys=None,
+        )
+        segment_ids = self.transition_segment_ids[atomic_idxs]
+        goal_idxs = self.segment_goal_indices[segment_ids]
+        batch['actor_goals'] = self._get_endpoint_goals(goal_idxs)
+        _attach_language_condition(self, batch, task_ids, evaluation)
+
+        # apply one augmentation pass to all visual inputs
+        if self.config['p_aug'] is not None and not evaluation:
+            if np.random.rand() < self.config['p_aug']:
+                self.augment(
+                    batch,
+                    ['observations', 'next_observations', 'actor_goals'],
+                )
+        return batch
 
 
 @dataclasses.dataclass
@@ -873,7 +1177,7 @@ class AtomicGCDataset(_AtomicSegmentDataset):
 
     def _get_endpoint_goals(self, goal_idxs):
         # Return endpoint images.
-        
+
         goals = jax.tree_util.tree_map(
             lambda arr: arr[goal_idxs], self.dataset['observations']
         )

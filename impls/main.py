@@ -20,6 +20,7 @@ from ml_collections import config_flags
 from utils.datasets import (
     AtomicBYOLDataset,
     AtomicGCDataset,
+    AtomicGoalLanguageDataset,
     AtomicLanguageDataset,
     Dataset,
     EndpointGoalDataset,
@@ -235,8 +236,12 @@ def _goal_sampling_summary(config):
         'num_language_tasks',
         'atomic_train_manifest_path',
         'atomic_val_manifest_path',
+        'atomic_train_manifest_sha256',
+        'atomic_val_manifest_sha256',
         'atomic_goal_stack_mode',
         'atomic_require_source_fingerprint',
+        'atomic_require_language_contract',
+        'atomic_require_goal_language_coupling',
         'reference_repository',
         'reference_commit',
         'reference_agent_sha256',
@@ -245,6 +250,7 @@ def _goal_sampling_summary(config):
         'language_embedding_path',
         'language_embedding_model',
         'language_embedding_sha256',
+        'language_task_spec_sha256',
         'language_embedding_dim',
         'language_min_train_retrieval_top1',
         'language_min_heldout_retrieval_top1',
@@ -384,6 +390,7 @@ def main(_):
     dataset_class = {
         'AtomicBYOLDataset': AtomicBYOLDataset,
         'AtomicGCDataset': AtomicGCDataset,
+        'AtomicGoalLanguageDataset': AtomicGoalLanguageDataset,
         'AtomicLanguageDataset': AtomicLanguageDataset,
         'EndpointGoalDataset': EndpointGoalDataset, # sample within an atomic episode (exclude final img)
         'EndpointInclusiveGCDataset': EndpointInclusiveGCDataset, # enable sampling final img
@@ -399,7 +406,12 @@ def main(_):
     }[config['dataset_class']]
     # set up training dataset with arguments
     train_dataset_kwargs = {}
-    if dataset_class in {AtomicBYOLDataset, AtomicGCDataset, AtomicLanguageDataset}:
+    if dataset_class in {
+        AtomicBYOLDataset,
+        AtomicGCDataset,
+        AtomicGoalLanguageDataset,
+        AtomicLanguageDataset,
+    }:
         train_dataset_kwargs['manifest_path'] = config['atomic_train_manifest_path']
         train_dataset_kwargs['source_dataset_name'] = FLAGS.env_name
         train_dataset_kwargs['source_split'] = 'train'
@@ -430,6 +442,7 @@ def main(_):
         if val_dataset_class in {
             AtomicBYOLDataset,
             AtomicGCDataset,
+            AtomicGoalLanguageDataset,
             AtomicLanguageDataset,
         }:
             val_dataset_kwargs['manifest_path'] = config['atomic_val_manifest_path']

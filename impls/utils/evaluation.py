@@ -6,6 +6,7 @@ from tqdm import trange
 from utils.language import (
     evaluation_language_condition,
     language_task_id_for_goal,
+    language_task_id_for_goal_xyz,
     load_language_cache,
 )
 
@@ -584,11 +585,20 @@ def evaluate(
             task_info = getattr(env.unwrapped, 'cur_task_info', None)
             goal_ij = task_info.get('goal_ij') if isinstance(task_info, dict) else None
             if uses_language:
-                target_language_task_id = language_task_id_for_goal(
-                    language_cache,
-                    goal_ij,
-                    fallback_task_id=task_id,
-                ) if goal_ij is not None else int(task_id)
+                if goal_ij is not None:
+                    target_language_task_id = language_task_id_for_goal(
+                        language_cache,
+                        goal_ij,
+                        fallback_task_id=task_id,
+                    )
+                elif goal_xyzs is not None and len(goal_xyzs) == 1:
+                    target_language_task_id = language_task_id_for_goal_xyz(
+                        language_cache,
+                        goal_xyzs[0],
+                        fallback_task_id=task_id,
+                    )
+                else:
+                    target_language_task_id = int(task_id)
                 (
                     language_embedding,
                     language_text,
@@ -670,6 +680,36 @@ def evaluate(
                     ),
                     'language_variant': language_eval_variant if uses_language else 'goal',
                     'language_text': language_text,
+                    'language_goal_row': (
+                        int(language_cache['task_ij'][target_language_task_id - 1, 0])
+                        if uses_language
+                        and target_language_task_id is not None
+                        and 'task_ij' in language_cache
+                        else None
+                    ),
+                    'language_goal_column': (
+                        int(language_cache['task_ij'][target_language_task_id - 1, 1])
+                        if uses_language
+                        and target_language_task_id is not None
+                        and 'task_ij' in language_cache
+                        else None
+                    ),
+                    'language_condition_row': (
+                        int(language_cache['task_ij'][condition_language_task_id - 1, 0])
+                        if uses_language
+                        and condition_language_task_id is not None
+                        and condition_language_task_id > 0
+                        and 'task_ij' in language_cache
+                        else None
+                    ),
+                    'language_condition_column': (
+                        int(language_cache['task_ij'][condition_language_task_id - 1, 1])
+                        if uses_language
+                        and condition_language_task_id is not None
+                        and condition_language_task_id > 0
+                        and 'task_ij' in language_cache
+                        else None
+                    ),
                     'episode_index': i,
                     'evaluation_seed': episode_seed,
                     'success': float(bool(flat_info.get('success', False))),
