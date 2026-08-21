@@ -1159,6 +1159,254 @@ class AtomicGoalLanguageDataset(AtomicLanguageDataset):
 
 
 @dataclasses.dataclass
+class CompositeLanguageDataset(_AtomicSegmentDataset):
+    """
+    D2 Double-Cube composite ranges conditioned on one ordered instruction."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        mode = str(self.config.get('language_dataset_mode', ''))
+        if mode != 'composite_ordered':
+            raise ValueError(
+                "CompositeLanguageDataset requires language_dataset_mode='composite_ordered'."
+            )
+        num_language_tasks = int(self.config['num_language_tasks'])
+        if np.any(self.transition_task_ids < 1) or np.any(
+            self.transition_task_ids > num_language_tasks
+        ):
+            raise ValueError(
+                f'Composite language task IDs must be in [1, {num_language_tasks}].'
+            )
+        _initialize_language_conditioning(self)
+        self._validate_composite_language_contract()
+
+    def _validate_composite_language_contract(self):
+        required = {
+            'language_contract_schema_version',
+            'language_task_spec_sha256',
+            'task_id_semantics',
+            'task_ids',
+            'task_atomic_task_ids',
+            'task_num_operations',
+            'task_family_ids',
+            'task_family_names',
+            'task_instructions',
+            'language_atomic_task_ids',
+            'language_num_operations',
+            'num_operations',
+            'family_id',
+            'family_name',
+            'source_atomic_segment_ids',
+        }
+        with np.load(self.manifest_path, allow_pickle=False) as manifest:
+            missing = required.difference(manifest.files)
+            if missing:
+                raise ValueError(
+                    'Ordered composite language manifest is missing contract keys: '
+                    f'{sorted(missing)}.'
+                )
+
+            def scalar(key, cast):
+                value = np.asarray(manifest[key])
+                if value.shape != ():
+                    raise ValueError(f'Composite contract scalar {key!r} must have shape ().')
+                return cast(value.item())
+
+            contract_version = scalar('language_contract_schema_version', int)
+            spec_sha256 = scalar('language_task_spec_sha256', str)
+            task_id_semantics = scalar('task_id_semantics', str)
+            task_ids = np.asarray(manifest['task_ids'], dtype=np.int32)
+            task_atomic_ids = np.asarray(manifest['task_atomic_task_ids'], dtype=np.int32)
+            task_num_operations = np.asarray(manifest['task_num_operations'], dtype=np.int32)
+            task_family_ids = np.asarray(manifest['task_family_ids'], dtype=np.int32)
+            task_family_names = np.asarray(manifest['task_family_names']).astype(str)
+            task_instructions = np.asarray(manifest['task_instructions']).astype(str)
+            segment_task_ids = np.asarray(manifest['task_id'], dtype=np.int32)
+            segment_atomic_ids = np.asarray(
+                manifest['language_atomic_task_ids'], dtype=np.int32
+            )
+            segment_language_num_operations = np.asarray(
+                manifest['language_num_operations'], dtype=np.int32
+            )
+            segment_num_operations = np.asarray(manifest['num_operations'], dtype=np.int32)
+            segment_family_ids = np.asarray(manifest['family_id'], dtype=np.int32)
+            segment_family_names = np.asarray(manifest['family_name']).astype(str)
+            source_atomic_ids = np.asarray(
+                manifest['source_atomic_segment_ids'], dtype=np.int32
+            )
+
+        if contract_version != 1:
+            raise ValueError('Unsupported ordered composite language-contract version.')
+        if task_id_semantics != 'ordered_atomic_sequence_language_id':
+            raise ValueError('Composite manifest task_id semantics are not ordered language IDs.')
+        num_tasks = int(self.config['num_language_tasks'])
+        expected_task_ids = np.arange(1, num_tasks + 1, dtype=np.int32)
+        if not np.array_equal(task_ids, expected_task_ids):
+            raise ValueError('Composite language task IDs must be complete and consecutive.')
+        if task_atomic_ids.shape != (num_tasks, 3):
+            raise ValueError('Composite task_atomic_task_ids must have shape (num_tasks, 3).')
+        for key, value in (
+            ('task_num_operations', task_num_operations),
+            ('task_family_ids', task_family_ids),
+            ('task_family_names', task_family_names),
+            ('task_instructions', task_instructions),
+        ):
+            if value.shape != (num_tasks,):
+                raise ValueError(f'Composite {key} must have shape (num_tasks,).')
+
+        num_segments = len(segment_task_ids)
+        for key, value in (
+            ('language_num_operations', segment_language_num_operations),
+            ('num_operations', segment_num_operations),
+            ('family_id', segment_family_ids),
+            ('family_name', segment_family_names),
+        ):
+            if value.shape != (num_segments,):
+                raise ValueError(f'Composite segment {key} must have shape (num_segments,).')
+        if segment_atomic_ids.shape != (num_segments, 3) or source_atomic_ids.shape != (
+            num_segments,
+            3,
+        ):
+            raise ValueError('Composite per-segment atomic-ID arrays must have shape (segments, 3).')
+        if not np.array_equal(segment_language_num_operations, segment_num_operations):
+            raise ValueError('Composite language operation counts disagree with D2 operation counts.')
+        if not np.array_equal(segment_atomic_ids, task_atomic_ids[segment_task_ids - 1]):
+            raise ValueError('Composite segment language IDs disagree with ordered atomic signatures.')
+        if not np.array_equal(
+            segment_language_num_operations, task_num_operations[segment_task_ids - 1]
+        ):
+            raise ValueError('Composite segment task IDs disagree with operation counts.')
+        if not np.array_equal(segment_family_ids, task_family_ids[segment_task_ids - 1]):
+            raise ValueError('Composite segment task IDs disagree with family IDs.')
+        if not np.array_equal(segment_family_names, task_family_names[segment_task_ids - 1]):
+            raise ValueError('Composite segment task IDs disagree with family names.')
+        columns = np.arange(3, dtype=np.int32)[None, :]
+        used = columns < segment_num_operations[:, None]
+        if np.any(segment_atomic_ids[used] <= 0) or np.any(segment_atomic_ids[~used] != -1):
+            raise ValueError('Composite language atomic IDs have invalid used slots or padding.')
+        if np.any(source_atomic_ids[used] < 0) or np.any(source_atomic_ids[~used] != -1):
+            raise ValueError('Composite source atomic IDs have invalid used slots or padding.')
+
+        cache = self.language_cache
+        cache_required = {
+            'language_contract_schema_version',
+            'task_id_semantics',
+            'task_spec_sha256',
+            'task_atomic_task_ids',
+            'task_num_operations',
+            'task_family_ids',
+            'task_family_names',
+        }
+        missing_cache = cache_required.difference(cache)
+        if missing_cache:
+            raise ValueError(
+                'Ordered composite language cache is missing contract keys: '
+                f'{sorted(missing_cache)}.'
+            )
+        comparisons = {
+            'task_ids': (task_ids, cache['task_ids']),
+            'task_atomic_task_ids': (task_atomic_ids, cache['task_atomic_task_ids']),
+            'task_num_operations': (task_num_operations, cache['task_num_operations']),
+            'task_family_ids': (task_family_ids, cache['task_family_ids']),
+            'task_family_names': (task_family_names, cache['task_family_names']),
+            'task_instructions': (task_instructions, cache['canonical_texts'].astype(str)),
+        }
+        for label, (manifest_value, cache_value) in comparisons.items():
+            if not np.array_equal(manifest_value, cache_value):
+                raise ValueError(f'Composite language cache {label} differs from the manifest.')
+        if int(cache['language_contract_schema_version']) != contract_version:
+            raise ValueError('Composite language cache contract version differs from the manifest.')
+        if str(cache['task_id_semantics']) != task_id_semantics:
+            raise ValueError('Composite language cache task-ID semantics differ from the manifest.')
+        if str(cache['task_spec_sha256']) != spec_sha256:
+            raise ValueError('Composite language cache task-spec SHA differs from the manifest.')
+        configured_spec_sha = str(self.config.get('language_task_spec_sha256', '') or '')
+        if configured_spec_sha and configured_spec_sha != spec_sha256:
+            raise ValueError('Configured composite language task-spec SHA is incorrect.')
+
+        self.manifest_summary.update(
+            {
+                'language_contract_verified': True,
+                'language_contract_schema_version': contract_version,
+                'task_spec_sha256': spec_sha256,
+                'task_id_semantics': task_id_semantics,
+                'num_language_tasks': num_tasks,
+                'num_supported_language_tasks': int(len(np.unique(segment_task_ids))),
+                'language_dataset_mode': 'composite_ordered',
+                'bridge_conditioning': 'same_compound_instruction_as_owner_composite',
+            }
+        )
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        batch, task_ids, _ = self._sample_atomic(
+            batch_size,
+            idxs=idxs,
+            evaluation=evaluation,
+            augment_keys=('observations', 'next_observations'),
+        )
+        return _attach_language_condition(self, batch, task_ids, evaluation)
+
+    def get_and_reset_diagnostics(self):
+        return _get_and_reset_language_diagnostics(self)
+
+
+@dataclasses.dataclass
+class CompositeGoalLanguageDataset(CompositeLanguageDataset):
+    """D2 composites conditioned on their final endpoint image and ordered text."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.segment_goal_indices is None:
+            raise ValueError('CompositeGoalLanguageDataset requires goal_index.')
+        self.atomic_goal_stack_mode = str(
+            self.config.get('atomic_goal_stack_mode', 'repeat_endpoint')
+        )
+        if self.atomic_goal_stack_mode != 'repeat_endpoint':
+            raise ValueError(
+                "CompositeGoalLanguageDataset requires atomic_goal_stack_mode='repeat_endpoint'."
+            )
+        self.manifest_summary.update(
+            {
+                'atomic_goal_stack_mode': self.atomic_goal_stack_mode,
+                'condition_coupling': (
+                    'same_composite_final_endpoint_image_and_ordered_language'
+                ),
+                'goal_language_coupling_verified': True,
+            }
+        )
+
+    def _get_endpoint_goals(self, goal_idxs):
+        goals = jax.tree_util.tree_map(
+            lambda arr: arr[goal_idxs], self.dataset['observations']
+        )
+        frame_stack = self.config['frame_stack']
+        if frame_stack is not None:
+            goals = jax.tree_util.tree_map(
+                lambda arr: np.concatenate([arr] * int(frame_stack), axis=-1), goals
+            )
+        return goals
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        batch, task_ids, composite_idxs = self._sample_atomic(
+            batch_size,
+            idxs=idxs,
+            evaluation=evaluation,
+            augment_keys=None,
+        )
+        segment_ids = self.transition_segment_ids[composite_idxs]
+        goal_idxs = self.segment_goal_indices[segment_ids]
+        batch['actor_goals'] = self._get_endpoint_goals(goal_idxs)
+        _attach_language_condition(self, batch, task_ids, evaluation)
+        if self.config['p_aug'] is not None and not evaluation:
+            if np.random.rand() < self.config['p_aug']:
+                self.augment(
+                    batch,
+                    ['observations', 'next_observations', 'actor_goals'],
+                )
+        return batch
+
+
+@dataclasses.dataclass
 class AtomicGCDataset(_AtomicSegmentDataset):
     """Atomic Cube conditioned on their endpoint image (not in an episode but in a pick-place task)"""
 
@@ -1288,6 +1536,134 @@ class AtomicBYOLDataset(AtomicGCDataset):
     def get_and_reset_diagnostics(self):
         count = self._byol_sample_count
         metrics = {'data/atomic_byol_samples': float(count)}
+        if count:
+            metrics.update(
+                {
+                    'data/atomic_byol_requested_offset_mean': (
+                        self._byol_requested_offset_sum / count
+                    ),
+                    'data/atomic_byol_effective_offset_mean': (
+                        self._byol_effective_offset_sum / count
+                    ),
+                    'data/atomic_byol_endpoint_fraction': self._byol_endpoint_count / count,
+                }
+            )
+        self._byol_sample_count = 0
+        self._byol_requested_offset_sum = 0
+        self._byol_effective_offset_sum = 0
+        self._byol_endpoint_count = 0
+        return metrics
+
+
+@dataclasses.dataclass
+class AtomicLanguageBYOLDataset(AtomicLanguageDataset):
+    """Atomic LCBC samples with geometric within-segment BYOL targets.
+
+    The behavior-cloning condition remains the frozen language embedding used
+    by :class:`AtomicLanguageDataset`.  ``value_goals`` are an additional
+    visual training signal and are never exposed as actor goals.  With frame
+    stacking enabled, both current observations and BYOL targets use their
+    actual temporal stacks rather than repeated endpoint frames.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.segment_goal_indices is None:
+            raise ValueError(
+                'AtomicLanguageBYOLDataset requires goal_index in its atomic manifest.'
+            )
+        discount = float(self.config['discount'])
+        if not 0.0 <= discount < 1.0:
+            raise ValueError('AtomicLanguageBYOLDataset discount must lie in [0, 1).')
+        if not bool(self.config['value_geom_sample']):
+            raise ValueError('AtomicLanguageBYOLDataset requires value_geom_sample=True.')
+
+        split_id = {'train': 0, 'val': 1}.get(self.source_split, 2)
+        run_seed = int(self.config.get('run_seed', 0))
+        self._byol_value_rng = np.random.default_rng(
+            np.random.SeedSequence([run_seed, 0xB10A, split_id])
+        )
+        # DrQ draws an independent spatial shift for every visual input.  Keep
+        # the extra BYOL-target shifts off the global NumPy stream so adding the
+        # auxiliary branch does not alter LCBC transition, augmentation, or
+        # language-variant sampling for a matched seed.
+        self._byol_aug_rng = np.random.default_rng(
+            np.random.SeedSequence([run_seed, 0xB10B, split_id])
+        )
+        self._byol_sample_count = 0
+        self._byol_requested_offset_sum = 0
+        self._byol_effective_offset_sum = 0
+        self._byol_endpoint_count = 0
+        self.manifest_summary.update(
+            {
+                'byol_value_goal_sampling': 'clipped_geometric_within_atomic_segment',
+                'byol_discount': discount,
+                'byol_rng_seed': run_seed,
+                'byol_actor_conditioning': 'language_only',
+                'byol_frame_stack_mode': 'temporal_stack_at_sampled_future_state',
+            }
+        )
+
+    def _augment_visual_inputs(self, batch):
+        """Augment LCBC inputs normally and the extra BYOL target independently."""
+        aug_type = self.config.get('aug_type', 'crop')
+        if aug_type == 'drq_shift':
+            pad = self.config.get('drq_shift_pad', 2)
+            random_shifts_batch(batch, ['observations', 'next_observations'], pad=pad)
+            random_shifts_batch(
+                batch,
+                ['value_goals'],
+                pad=pad,
+                rng=self._byol_aug_rng,
+            )
+        else:
+            # Crop augmentation already uses one shared crop for every key, so
+            # adding value_goals consumes no additional global random numbers.
+            self.augment(batch, ['observations', 'next_observations', 'value_goals'])
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        batch, task_ids, atomic_idxs = self._sample_atomic(
+            batch_size,
+            idxs=idxs,
+            evaluation=evaluation,
+            augment_keys=None,
+        )
+        raw_idxs = self.transition_indices[atomic_idxs]
+        segment_ids = self.transition_segment_ids[atomic_idxs]
+        endpoint_idxs = self.segment_goal_indices[segment_ids]
+
+        requested_offsets = self._byol_value_rng.geometric(
+            p=1.0 - float(self.config['discount']),
+            size=len(raw_idxs),
+        )
+        value_goal_idxs = np.minimum(raw_idxs + requested_offsets, endpoint_idxs)
+        if np.any(value_goal_idxs <= raw_idxs) or np.any(value_goal_idxs > endpoint_idxs):
+            raise RuntimeError('Atomic language BYOL target escaped its declared segment bounds.')
+
+        batch['value_goals'] = self.get_observations(value_goal_idxs)
+        successes = (raw_idxs == value_goal_idxs).astype(float)
+        batch['masks'] = 1.0 - successes
+        batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
+
+        if not evaluation:
+            effective_offsets = value_goal_idxs - raw_idxs
+            self._byol_sample_count += len(raw_idxs)
+            self._byol_requested_offset_sum += int(np.sum(requested_offsets))
+            self._byol_effective_offset_sum += int(np.sum(effective_offsets))
+            self._byol_endpoint_count += int(np.sum(value_goal_idxs == endpoint_idxs))
+
+        # Preserve AtomicLanguageDataset's ordering of visual augmentation
+        # before language-variant sampling.  The extra value-goal DrQ shift is
+        # drawn from the isolated RNG initialized above.
+        if self.config['p_aug'] is not None and not evaluation:
+            if np.random.rand() < self.config['p_aug']:
+                self._augment_visual_inputs(batch)
+        return _attach_language_condition(self, batch, task_ids, evaluation)
+
+    def get_and_reset_diagnostics(self):
+        metrics = _get_and_reset_language_diagnostics(self)
+        count = self._byol_sample_count
+        metrics['data/atomic_byol_samples'] = float(count)
         if count:
             metrics.update(
                 {

@@ -21,7 +21,10 @@ from utils.datasets import (
     AtomicBYOLDataset,
     AtomicGCDataset,
     AtomicGoalLanguageDataset,
+    AtomicLanguageBYOLDataset,
     AtomicLanguageDataset,
+    CompositeGoalLanguageDataset,
+    CompositeLanguageDataset,
     Dataset,
     EndpointGoalDataset,
     EndpointInclusiveGCDataset,
@@ -228,7 +231,21 @@ def _goal_sampling_summary(config):
         'p_aug',
         'frame_stack',
         'policy_conditioning',
+        'discount',
+        'alignment',
+        'bc_weight',
+        'target',
+        'tau',
+        'action_forward',
+        'pred_backwards',
+        'pred_both',
+        'pred_loss_type',
+        'policy_repr',
+        'use_obs_latent_dim',
+        'value_latent_dim',
+        'ensemble_size',
         'language_dataset_mode',
+        'composite_eval_order',
         'endpoint_dataset_mode',
         'endpoint_sampling',
         'endpoint_train_manifest_path',
@@ -391,7 +408,10 @@ def main(_):
         'AtomicBYOLDataset': AtomicBYOLDataset,
         'AtomicGCDataset': AtomicGCDataset,
         'AtomicGoalLanguageDataset': AtomicGoalLanguageDataset,
+        'AtomicLanguageBYOLDataset': AtomicLanguageBYOLDataset,
         'AtomicLanguageDataset': AtomicLanguageDataset,
+        'CompositeGoalLanguageDataset': CompositeGoalLanguageDataset,
+        'CompositeLanguageDataset': CompositeLanguageDataset,
         'EndpointGoalDataset': EndpointGoalDataset, # sample within an atomic episode (exclude final img)
         'EndpointInclusiveGCDataset': EndpointInclusiveGCDataset, # enable sampling final img
         'EndpointLanguageDataset': EndpointLanguageDataset,
@@ -410,7 +430,10 @@ def main(_):
         AtomicBYOLDataset,
         AtomicGCDataset,
         AtomicGoalLanguageDataset,
+        AtomicLanguageBYOLDataset,
         AtomicLanguageDataset,
+        CompositeGoalLanguageDataset,
+        CompositeLanguageDataset,
     }:
         train_dataset_kwargs['manifest_path'] = config['atomic_train_manifest_path']
         train_dataset_kwargs['source_dataset_name'] = FLAGS.env_name
@@ -443,7 +466,10 @@ def main(_):
             AtomicBYOLDataset,
             AtomicGCDataset,
             AtomicGoalLanguageDataset,
+            AtomicLanguageBYOLDataset,
             AtomicLanguageDataset,
+            CompositeGoalLanguageDataset,
+            CompositeLanguageDataset,
         }:
             val_dataset_kwargs['manifest_path'] = config['atomic_val_manifest_path']
             val_dataset_kwargs['source_dataset_name'] = FLAGS.env_name
@@ -498,6 +524,10 @@ def main(_):
         from agents.byol import BYOLAgent
 
         agent_class = BYOLAgent
+    elif config['agent_name'] == 'language_byol_gamma':
+        from agents.language_byol import LanguageBYOLAgent
+
+        agent_class = LanguageBYOLAgent
     else:
         agent_class = agents[config['agent_name']]
     agent = agent_class.create(
@@ -506,7 +536,7 @@ def main(_):
         example_batch['actions'],
         config,
     )
-    if config['agent_name'] == 'byol_gamma':
+    if config['agent_name'] in {'byol_gamma', 'language_byol_gamma'}:
         from agents.byol import get_reference_provenance
 
         _write_json(

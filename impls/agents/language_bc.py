@@ -100,6 +100,7 @@ def get_config():
                 dataset_class='AtomicLanguageDataset',
                 policy_conditioning='language',
                 language_dataset_mode='atomic_movement',
+                composite_eval_order='red_first',
                 endpoint_dataset_mode='stable_achieved_endpoint',
                 endpoint_sampling='uniform_transitions',
                 endpoint_train_manifest_path='',

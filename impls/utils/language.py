@@ -35,6 +35,8 @@ def load_language_cache(path, num_tasks, embedding_dim):
         scalar_optional = (
             'cache_schema_version',
             'task_spec_sha256',
+            'language_contract_schema_version',
+            'task_id_semantics',
             'pooling',
             'model_revision',
             'retrieval_reference',
@@ -48,6 +50,25 @@ def load_language_cache(path, num_tasks, embedding_dim):
         for key in ('task_ij', 'task_coarse_ij', 'task_local_ij'):
             if key in data.files:
                 cache[key] = np.asarray(data[key], dtype=np.int32)
+        for key in (
+            'task_atomic_task_ids',
+            'task_num_operations',
+            'task_family_ids',
+            'atomic_task_ids',
+            'atomic_task_cube_ids',
+            'atomic_task_destination_types',
+            'atomic_task_grid_rows',
+            'atomic_task_grid_columns',
+        ):
+            if key in data.files:
+                cache[key] = np.asarray(data[key], dtype=np.int32)
+        for key in ('task_family_names',):
+            if key in data.files:
+                cache[key] = np.asarray(data[key]).astype(str)
+        if 'official_swap_staging_xyz' in data.files:
+            cache['official_swap_staging_xyz'] = np.asarray(
+                data['official_swap_staging_xyz'], dtype=np.float32
+            )
         for key in ('grid_world_x_edges', 'grid_world_y_edges'):
             if key in data.files:
                 cache[key] = np.asarray(data[key], dtype=np.float32)
@@ -87,10 +108,76 @@ def load_language_cache(path, num_tasks, embedding_dim):
         if key in cache and cache[key].shape != (num_tasks, 2):
             raise ValueError(f"{key} has shape {cache[key].shape}; expected {(num_tasks, 2)}.")
 
+    composite_keys = {
+        'task_atomic_task_ids',
+        'task_num_operations',
+        'task_family_ids',
+        'task_family_names',
+    }
+    if composite_keys.intersection(cache):
+        missing = composite_keys.difference(cache)
+        if missing:
+            raise ValueError(
+                'Composite language cache metadata is incomplete: '
+                f'{sorted(missing)}.'
+            )
+        if cache['task_atomic_task_ids'].shape != (num_tasks, 3):
+            raise ValueError('task_atomic_task_ids must have shape (num_tasks, 3).')
+        for key in ('task_num_operations', 'task_family_ids', 'task_family_names'):
+            if cache[key].shape != (num_tasks,):
+                raise ValueError(f'{key} must have shape (num_tasks,).')
+        num_operations = cache['task_num_operations']
+        if np.any((num_operations < 1) | (num_operations > 3)):
+            raise ValueError('Composite language tasks must contain one to three operations.')
+        operation_columns = np.arange(3, dtype=np.int32)[None, :]
+        used = operation_columns < num_operations[:, None]
+        if np.any(cache['task_atomic_task_ids'][used] <= 0) or np.any(
+            cache['task_atomic_task_ids'][~used] != -1
+        ):
+            raise ValueError(
+                'Composite task atomic IDs must be positive in used slots and -1 in padding.'
+            )
+        signatures = {
+            (
+                int(cache['task_family_ids'][index]),
+                tuple(cache['task_atomic_task_ids'][index].tolist()),
+            )
+            for index in range(num_tasks)
+        }
+        if len(signatures) != num_tasks:
+            raise ValueError('Composite language task signatures must be unique.')
+
+    atomic_keys = {
+        'atomic_task_ids',
+        'atomic_task_cube_ids',
+        'atomic_task_destination_types',
+        'atomic_task_grid_rows',
+        'atomic_task_grid_columns',
+    }
+    if atomic_keys.intersection(cache):
+        missing = atomic_keys.difference(cache)
+        if missing:
+            raise ValueError(
+                f'Composite atomic-task lookup metadata is incomplete: {sorted(missing)}.'
+            )
+        primitive_count = len(cache['atomic_task_ids'])
+        for key in atomic_keys:
+            if cache[key].shape != (primitive_count,):
+                raise ValueError(f'{key} must have shape ({primitive_count},).')
+        if not np.array_equal(
+            cache['atomic_task_ids'],
+            np.arange(1, primitive_count + 1, dtype=np.int32),
+        ):
+            raise ValueError('atomic_task_ids must be consecutive and one-indexed.')
+    if 'official_swap_staging_xyz' in cache:
+        staging = cache['official_swap_staging_xyz']
+        if staging.shape != (3,) or not np.all(np.isfinite(staging)):
+            raise ValueError('official_swap_staging_xyz must be one finite XYZ coordinate.')
+
     grid_keys = ('grid_world_x_edges', 'grid_world_y_edges')
     if any(key in cache for key in grid_keys):
-        if not all(key in cache for key in grid_keys) or 'task_ij' not in cache:
-            raise ValueError('Language grid edges and task_ij must be provided together.')
+        if not all(key in cache for key in grid_keys):
+            raise ValueError('Language grid X and Y edges must be provided together.')
         for key in grid_keys:
             edges = cache[key]
             if edges.ndim != 1 or len(edges) < 2 or np.any(np.diff(edges) <= 0):
@@ -99,10 +186,39 @@ def load_language_cache(path, num_tasks, embedding_dim):
             len(cache['grid_world_x_edges']) - 1,
             len(cache['grid_world_y_edges']) - 1,
         )
-        if np.any(cache['task_ij'] < 0) or np.any(
-            cache['task_ij'] >= np.asarray(expected_shape, dtype=np.int32)
-        ):
-            raise ValueError(f'task_ij contains cells outside language grid shape {expected_shape}.')
+        if 'task_ij' in cache:
+            if np.any(cache['task_ij'] < 0) or np.any(
+                cache['task_ij'] >= np.asarray(expected_shape, dtype=np.int32)
+            ):
+                raise ValueError(
+                    f'task_ij contains cells outside language grid shape {expected_shape}.'
+                )
+        elif atomic_keys.issubset(cache):
+            table = cache['atomic_task_destination_types'] == 0
+            primitive_cells = np.stack(
+                [
+                    cache['atomic_task_grid_rows'],
+                    cache['atomic_task_grid_columns'],
+                ],
+                axis=1,
+            )
+            if np.any(primitive_cells[table] < 0) or np.any(
+                primitive_cells[table]
+                >= np.asarray(expected_shape, dtype=np.int32)
+            ):
+                raise ValueError(
+                    'Composite primitive table cells lie outside language grid '
+                    f'shape {expected_shape}.'
+                )
+            if np.any(primitive_cells[~table] != -1):
+                raise ValueError(
+                    'Non-table composite primitives must use -1 grid-cell metadata.'
+                )
+        else:
+            raise ValueError(
+                'Language grid edges require either per-task task_ij or '
+                'composite primitive lookup metadata.'
+            )
 
     for key in ('canonical_embeddings', 'train_embeddings', 'heldout_embeddings'):
         embeddings = np.asarray(cache[key], dtype=np.float32)
@@ -182,6 +298,33 @@ def language_task_id_for_goal_xyz(cache, goal_xyz, fallback_task_id=None):
             f'Language grid cell {(row, column)} is absent or duplicated in the cache.'
         )
     return int(matches[0] + 1)
+
+
+def language_task_id_for_atomic_sequence(cache, family_id, atomic_task_ids):
+    """map an ordered Double-Cube primitive sequence to its language task id"""
+    required = {'task_atomic_task_ids', 'task_num_operations', 'task_family_ids'}
+    missing = required.difference(cache)
+    if missing:
+        raise ValueError(
+            'Language cache has no ordered-composite contract: '
+            f'{sorted(missing)}.'
+        )
+    atomic_task_ids = np.asarray(tuple(atomic_task_ids), dtype=np.int32)
+    if atomic_task_ids.ndim != 1 or not 1 <= len(atomic_task_ids) <= 3:
+        raise ValueError('An ordered atomic sequence must contain one to three task IDs.')
+    padded = np.full(3, -1, dtype=np.int32)
+    padded[: len(atomic_task_ids)] = atomic_task_ids
+    matches = np.flatnonzero(
+        (cache['task_family_ids'] == int(family_id))
+        & (cache['task_num_operations'] == len(atomic_task_ids))
+        & np.all(cache['task_atomic_task_ids'] == padded[None, :], axis=1)
+    )
+    if len(matches) != 1:
+        raise ValueError(
+            'Ordered Double-Cube language signature is absent or duplicated: '
+            f'family={int(family_id)}, atomic_task_ids={atomic_task_ids.tolist()}.'
+        )
+    return int(cache['task_ids'][matches[0]])
 
 
 def _validate_evaluation_request(cache, task_id, variant, episode_index):

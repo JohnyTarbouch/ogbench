@@ -5,6 +5,7 @@ import numpy as np
 from tqdm import trange
 from utils.language import (
     evaluation_language_condition,
+    language_task_id_for_atomic_sequence,
     language_task_id_for_goal,
     language_task_id_for_goal_xyz,
     load_language_cache,
@@ -108,6 +109,169 @@ def _task_goal_xyz(env):
     target_block = int(getattr(unwrapped, '_target_block', 0))
     target_block = min(max(target_block, 0), len(goal_xyzs) - 1)
     return goal_xyzs[target_block, :3].copy()
+
+
+def _initial_cube_xyzs(initial_info, num_cubes=2):
+    rows = []
+    for cube_id in range(num_cubes):
+        value = _info_vector(initial_info, f'privileged/block_{cube_id}_pos')
+        if value is None or value.size < 3:
+            raise ValueError(
+                'Ordered Double-Cube language evaluation requires privileged '
+                f'initial position for physical cube {cube_id}.'
+            )
+        rows.append(value[:3])
+    return np.asarray(rows, dtype=np.float64)
+
+
+def _composite_family_id(cache, family_name):
+    required = {'task_family_ids', 'task_family_names'}
+    missing = required.difference(cache)
+    if missing:
+        raise ValueError(f'Composite language cache lacks family metadata: {sorted(missing)}.')
+    matches = np.flatnonzero(cache['task_family_names'].astype(str) == str(family_name))
+    family_ids = np.unique(cache['task_family_ids'][matches])
+    if len(matches) == 0 or len(family_ids) != 1:
+        raise ValueError(f'Composite language family {family_name!r} is absent or ambiguous.')
+    return int(family_ids[0])
+
+
+def _composite_atomic_task_for_table_goal(cache, cube_id, goal_xyz):
+    required = {
+        'atomic_task_ids',
+        'atomic_task_cube_ids',
+        'atomic_task_destination_types',
+        'atomic_task_grid_rows',
+        'atomic_task_grid_columns',
+        'grid_world_x_edges',
+        'grid_world_y_edges',
+    }
+    missing = required.difference(cache)
+    if missing:
+        raise ValueError(
+            f'Composite language cache lacks atomic table lookup metadata: {sorted(missing)}.'
+        )
+    goal_xyz = np.asarray(goal_xyz, dtype=np.float64)
+    if goal_xyz.shape != (3,) or not np.all(np.isfinite(goal_xyz)):
+        raise ValueError('Double-Cube table goal must be one finite XYZ coordinate.')
+    x_edges = np.asarray(cache['grid_world_x_edges'], dtype=np.float64)
+    y_edges = np.asarray(cache['grid_world_y_edges'], dtype=np.float64)
+    if not (
+        x_edges[0] <= goal_xyz[0] <= x_edges[-1]
+        and y_edges[0] <= goal_xyz[1] <= y_edges[-1]
+    ):
+        raise ValueError(f'Double-Cube table goal lies outside the language grid: {goal_xyz}.')
+    row = int(np.searchsorted(x_edges[1:-1], goal_xyz[0], side='right'))
+    column = int(np.searchsorted(y_edges[1:-1], goal_xyz[1], side='right'))
+    matches = np.flatnonzero(
+        (cache['atomic_task_cube_ids'] == int(cube_id))
+        & (cache['atomic_task_destination_types'] == 0)
+        & (cache['atomic_task_grid_rows'] == row)
+        & (cache['atomic_task_grid_columns'] == column)
+    )
+    if len(matches) != 1:
+        raise ValueError(
+            'Double-Cube table goal has no unique primitive language task: '
+            f'cube={cube_id}, cell={(row, column)}.'
+        )
+    return int(cache['atomic_task_ids'][matches[0]])
+
+
+def _composite_atomic_task_for_stack(cache, active_cube_id):
+    required = {
+        'atomic_task_ids',
+        'atomic_task_cube_ids',
+        'atomic_task_destination_types',
+    }
+    missing = required.difference(cache)
+    if missing:
+        raise ValueError(
+            f'Composite language cache lacks atomic stack lookup metadata: {sorted(missing)}.'
+        )
+    matches = np.flatnonzero(
+        (cache['atomic_task_cube_ids'] == int(active_cube_id))
+        & (cache['atomic_task_destination_types'] == 1)
+    )
+    if len(matches) != 1:
+        raise ValueError(
+            f'Physical cube {active_cube_id} has no unique stack-on-other primitive.'
+        )
+    return int(cache['atomic_task_ids'][matches[0]])
+
+
+def _cube_double_composite_language_task(
+    cache,
+    environment_task_id,
+    initial_info,
+    goal_xyzs,
+    order='red_first',
+):
+    """Return the post-reset ordered command for an official Double-Cube task."""
+    goal_xyzs = np.asarray(goal_xyzs, dtype=np.float64)
+    if goal_xyzs.shape != (2, 3):
+        raise ValueError(
+            f'Ordered Double-Cube evaluation requires two physical goals, got {goal_xyzs.shape}.'
+        )
+    if order not in {'red_first', 'blue_first'}:
+        raise ValueError("composite_eval_order must be 'red_first' or 'blue_first'.")
+    initial_xyzs = _initial_cube_xyzs(initial_info, num_cubes=2)
+
+    if environment_task_id == 1:
+        distances = np.linalg.norm(goal_xyzs - initial_xyzs, axis=1)
+        active_cube = int(np.argmax(distances))
+        sequence = (
+            _composite_atomic_task_for_table_goal(
+                cache, active_cube, goal_xyzs[active_cube]
+            ),
+        )
+        family_name = 'singleton'
+    elif environment_task_id in (2, 3):
+        cube_order = (0, 1) if order == 'red_first' else (1, 0)
+        sequence = tuple(
+            _composite_atomic_task_for_table_goal(cache, cube_id, goal_xyzs[cube_id])
+            for cube_id in cube_order
+        )
+        family_name = 'double_table'
+    elif environment_task_id == 4:
+        # The frozen oracle/reference protocol uses this empty staging point.
+        staging = np.asarray(
+            cache.get('official_swap_staging_xyz', [0.35, 0.0, 0.02]),
+            dtype=np.float64,
+        )
+        # D2 contains only the red-first swap convention.  Keep the declared
+        # blue-first diagnostic scoped to Tasks 2--3 instead of inventing an
+        # unsupported swap command at evaluation time.
+        first_cube, second_cube = (0, 1)
+        sequence = (
+            _composite_atomic_task_for_table_goal(cache, first_cube, staging),
+            _composite_atomic_task_for_table_goal(
+                cache, second_cube, goal_xyzs[second_cube]
+            ),
+            _composite_atomic_task_for_table_goal(
+                cache, first_cube, goal_xyzs[first_cube]
+            ),
+        )
+        family_name = 'coarse_swap'
+    elif environment_task_id == 5:
+        base_cube = int(np.argmin(goal_xyzs[:, 2]))
+        top_cube = 1 - base_cube
+        sequence = (
+            _composite_atomic_task_for_table_goal(
+                cache, base_cube, goal_xyzs[base_cube]
+            ),
+            _composite_atomic_task_for_stack(cache, top_cube),
+        )
+        family_name = 'base_stack'
+    else:
+        raise ValueError(
+            f'Unsupported official Double-Cube environment task ID: {environment_task_id}.'
+        )
+
+    family_id = _composite_family_id(cache, family_name)
+    language_task_id = language_task_id_for_atomic_sequence(
+        cache, family_id, sequence
+    )
+    return language_task_id, sequence, family_name
 
 
 def _first_true_step(mask, start=0):
@@ -582,10 +746,28 @@ def evaluate(
             language_embedding = None
             target_language_task_id = None
             condition_language_task_id = None
+            language_atomic_sequence = ()
+            language_family_name = ''
             task_info = getattr(env.unwrapped, 'cur_task_info', None)
             goal_ij = task_info.get('goal_ij') if isinstance(task_info, dict) else None
             if uses_language:
-                if goal_ij is not None:
+                if config.get('language_dataset_mode') == 'composite_ordered':
+                    if goal_xyzs is None:
+                        raise ValueError(
+                            'Ordered Double-Cube language evaluation requires physical goal XYZs.'
+                        )
+                    (
+                        target_language_task_id,
+                        language_atomic_sequence,
+                        language_family_name,
+                    ) = _cube_double_composite_language_task(
+                        language_cache,
+                        int(task_id),
+                        initial_info,
+                        goal_xyzs,
+                        order=str(config.get('composite_eval_order', 'red_first')),
+                    )
+                elif goal_ij is not None:
                     target_language_task_id = language_task_id_for_goal(
                         language_cache,
                         goal_ij,
@@ -680,6 +862,16 @@ def evaluate(
                     ),
                     'language_variant': language_eval_variant if uses_language else 'goal',
                     'language_text': language_text,
+                    'language_family_name': language_family_name or None,
+                    'language_atomic_task_ids': [
+                        int(value) for value in language_atomic_sequence
+                    ],
+                    'composite_eval_order': (
+                        str(config.get('composite_eval_order', 'red_first'))
+                        if uses_language
+                        and config.get('language_dataset_mode') == 'composite_ordered'
+                        else None
+                    ),
                     'language_goal_row': (
                         int(language_cache['task_ij'][target_language_task_id - 1, 0])
                         if uses_language
