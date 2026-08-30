@@ -570,6 +570,7 @@ class _AtomicSegmentDataset(GCDataset):
 
         required = {'transition_indices', 'transition_segment_ids', 'task_id'}
         with np.load(manifest_path, allow_pickle=False) as manifest:
+            available = set(manifest.files)
             missing = required.difference(manifest.files)
             if missing:
                 raise ValueError(f'Atomic segment manifest is missing keys: {sorted(missing)}')
@@ -601,6 +602,11 @@ class _AtomicSegmentDataset(GCDataset):
             transition_indices = np.asarray(manifest['transition_indices'], dtype=np.int64)
             transition_segment_ids = np.asarray(manifest['transition_segment_ids'], dtype=np.int64)
             segment_task_ids = np.asarray(manifest['task_id'], dtype=np.int64)
+            segment_family_ids = (
+                np.asarray(manifest['family_id'], dtype=np.int64)
+                if 'family_id' in available
+                else None
+            )
             segment_episode_ids = (
                 np.asarray(manifest['episode_id'], dtype=np.int64)
                 if 'episode_id' in manifest.files
@@ -626,6 +632,39 @@ class _AtomicSegmentDataset(GCDataset):
                 if 'num_transitions' in manifest.files
                 else None
             )
+            transition_reuse_policy = (
+                str(np.asarray(manifest['transition_reuse_policy']).item())
+                if 'transition_reuse_policy' in available
+                else 'forbid'
+            )
+            reuse_metadata = {
+                key: int(np.asarray(manifest[key]).item())
+                for key in (
+                    'num_unique_transition_indices',
+                    'num_reused_transition_occurrences',
+                    'max_transition_multiplicity',
+                )
+                if key in available
+            }
+            sampling_reference_family_ids = (
+                np.asarray(manifest['grouping_family_ids'], dtype=np.int32)
+                if 'grouping_family_ids' in available
+                else None
+            )
+            sampling_reference_probabilities = (
+                np.asarray(
+                    manifest['sampling_reference_family_probabilities'],
+                    dtype=np.float64,
+                )
+                if 'sampling_reference_family_probabilities' in available
+                else None
+            )
+            if (sampling_reference_family_ids is None) != (
+                sampling_reference_probabilities is None
+            ):
+                raise ValueError(
+                    'Atomic sampling-reference IDs and probabilities must be declared together.'
+                )
 
         def provenance_scalar(key, cast):
             value = provenance[key]
@@ -696,10 +735,34 @@ class _AtomicSegmentDataset(GCDataset):
             raise ValueError(
                 f'Atomic transition indices must be in [0, {self.raw_size - 2}] so next observations exist.'
             )
-        if len(np.unique(transition_indices)) != len(transition_indices):
+        unique_transition_indices, transition_multiplicities = np.unique(
+            transition_indices, return_counts=True
+        )
+        num_reused_occurrences = len(transition_indices) - len(unique_transition_indices)
+        configured_reuse_policy = str(
+            self.config.get('atomic_transition_reuse_policy', 'forbid')
+        )
+        allowed_reuse_policy = 'explicit_segment_horizons_v1'
+        if transition_reuse_policy != configured_reuse_policy:
+            raise ValueError(
+                'Atomic transition-reuse policy in the manifest and config must match.'
+            )
+        if num_reused_occurrences and transition_reuse_policy != allowed_reuse_policy:
             raise ValueError('Atomic manifest contains duplicate transition indices.')
+        if transition_reuse_policy not in {'forbid', allowed_reuse_policy}:
+            raise ValueError('Atomic manifest declares an unsupported transition-reuse policy.')
+        if transition_reuse_policy == allowed_reuse_policy:
+            expected_reuse_metadata = {
+                'num_unique_transition_indices': len(unique_transition_indices),
+                'num_reused_transition_occurrences': num_reused_occurrences,
+                'max_transition_multiplicity': int(transition_multiplicities.max()),
+            }
+            if reuse_metadata != expected_reuse_metadata:
+                raise ValueError('Atomic overlapping-horizon reuse metadata is inconsistent.')
 
         num_segments = len(segment_task_ids)
+        if segment_family_ids is not None and segment_family_ids.shape != (num_segments,):
+            raise ValueError('Atomic manifest family_id must have one entry per segment.')
         if segment_episode_ids is not None and segment_episode_ids.shape != (num_segments,):
             raise ValueError('Atomic manifest episode_id must have one entry per segment.')
         if segment_goal_indices is not None:
@@ -768,6 +831,69 @@ class _AtomicSegmentDataset(GCDataset):
                 raise ValueError('Atomic transition and goal indices must belong to the same episode.')
 
         task_ids = segment_task_ids[transition_segment_ids]
+        transition_family_ids = (
+            segment_family_ids[transition_segment_ids]
+            if segment_family_ids is not None
+            else None
+        )
+
+        sampling_mode = str(self.config.get('atomic_sampling_mode', 'uniform_transition'))
+        self._atomic_sampling_family_positions = None
+        self._atomic_sampling_family_probabilities = None
+        if sampling_mode == 'family_weighted_v1':
+            family_ids = np.asarray(
+                self.config.get('atomic_sampling_family_ids', ()), dtype=np.int32
+            )
+            family_probabilities = np.asarray(
+                self.config.get('atomic_sampling_family_probabilities', ()),
+                dtype=np.float64,
+            )
+            if (
+                family_ids.ndim != 1
+                or family_probabilities.ndim != 1
+                or not len(family_ids)
+                or len(family_ids) != len(family_probabilities)
+            ):
+                raise ValueError('Atomic family sampling IDs and probabilities are malformed.')
+            if len(np.unique(family_ids)) != len(family_ids):
+                raise ValueError('Atomic family sampling IDs must be unique.')
+            if np.any(~np.isfinite(family_probabilities)) or np.any(
+                family_probabilities <= 0
+            ):
+                raise ValueError('Atomic family sampling probabilities must be finite and positive.')
+            if not np.isclose(float(np.sum(family_probabilities)), 1.0, atol=1e-8):
+                raise ValueError('Atomic family sampling probabilities must sum to one.')
+            sampling_family_values = (
+                transition_family_ids
+                if transition_family_ids is not None
+                else task_ids
+            )
+            family_positions = [
+                np.flatnonzero(sampling_family_values == family_id).astype(np.int64)
+                for family_id in family_ids
+            ]
+            if any(not len(positions) for positions in family_positions):
+                raise ValueError('Atomic family sampling requested an empty family.')
+            if sampling_reference_family_ids is not None:
+                if not np.array_equal(family_ids, sampling_reference_family_ids):
+                    raise ValueError('Configured family IDs disagree with the manifest reference.')
+                # The train manifest defines the controlled family mixture.
+                # Validation uses that same configured mixture even when the
+                # smaller validation split has different natural proportions.
+                if self.source_split == 'train' and not np.allclose(
+                    family_probabilities,
+                    sampling_reference_probabilities,
+                    rtol=0.0,
+                    atol=1e-8,
+                ):
+                    raise ValueError(
+                        'Configured family probabilities disagree with the manifest reference.'
+                    )
+            self._atomic_sampling_family_positions = family_positions
+            self._atomic_sampling_family_probabilities = family_probabilities
+            self._atomic_sampling_family_ids = family_ids
+        elif sampling_mode != 'uniform_transition':
+            raise ValueError(f'Unsupported atomic sampling mode: {sampling_mode!r}.')
 
         self.manifest_path = manifest_path
         self.transition_indices = transition_indices
@@ -775,6 +901,7 @@ class _AtomicSegmentDataset(GCDataset):
         self.transition_task_ids = task_ids.astype(np.int32)
         self.segment_goal_indices = segment_goal_indices
         self.size = len(transition_indices)
+        self.atomic_sampling_mode = sampling_mode
 
         task_values, task_counts = np.unique(self.transition_task_ids, return_counts=True)
         used_segment_ids = np.unique(self.transition_segment_ids)
@@ -794,7 +921,27 @@ class _AtomicSegmentDataset(GCDataset):
                 str(int(task_id)): int(count)
                 for task_id, count in zip(task_values, task_counts)
             },
+            'transition_reuse_policy': transition_reuse_policy,
+            'num_unique_transition_indices': int(len(unique_transition_indices)),
+            'num_reused_transition_occurrences': int(num_reused_occurrences),
+            'max_transition_multiplicity': int(transition_multiplicities.max()),
+            'atomic_sampling_mode': sampling_mode,
+            'atomic_sampling_family_field': (
+                'family_id' if transition_family_ids is not None else 'task_id'
+            ),
         }
+        if self._atomic_sampling_family_positions is not None:
+            self.manifest_summary.update(
+                {
+                    'atomic_sampling_family_ids': [
+                        int(value) for value in self._atomic_sampling_family_ids
+                    ],
+                    'atomic_sampling_family_probabilities': [
+                        float(value)
+                        for value in self._atomic_sampling_family_probabilities
+                    ],
+                }
+            )
         if provenance_keys.issubset(provenance):
             self.manifest_summary.update(
                 {
@@ -815,7 +962,25 @@ class _AtomicSegmentDataset(GCDataset):
     def _sample_atomic(self, batch_size, idxs=None, evaluation=False, augment_keys=None):
         """Sample transitions and their internal language-task labels."""
         if idxs is None:
-            idxs = np.random.randint(self.size, size=batch_size)
+            if self._atomic_sampling_family_positions is None:
+                idxs = np.random.randint(self.size, size=batch_size)
+            else:
+                sampled_families = np.random.choice(
+                    len(self._atomic_sampling_family_positions),
+                    size=batch_size,
+                    p=self._atomic_sampling_family_probabilities,
+                )
+                idxs = np.empty(batch_size, dtype=np.int64)
+                for family_offset, positions in enumerate(
+                    self._atomic_sampling_family_positions
+                ):
+                    output_positions = np.flatnonzero(
+                        sampled_families == family_offset
+                    )
+                    if len(output_positions):
+                        idxs[output_positions] = positions[
+                            np.random.randint(len(positions), size=len(output_positions))
+                        ]
         idxs = np.asarray(idxs, dtype=np.int64)
         if np.any(idxs < 0) or np.any(idxs >= self.size):
             raise IndexError(f'Atomic dataset positions must be in [0, {self.size - 1}].')
@@ -883,8 +1048,29 @@ class AtomicLanguageDataset(_AtomicSegmentDataset):
             contract_version = np.asarray(
                 manifest['language_contract_schema_version']
             )
-            if contract_version.shape != () or int(contract_version.item()) != 1:
+            if contract_version.shape != () or int(contract_version.item()) not in (1, 2):
                 raise ValueError('Unsupported atomic language-contract schema version.')
+            contract_version = int(contract_version.item())
+            if contract_version == 2:
+                clipped_required = {
+                    'goal_xyz',
+                    'goal_label_was_clipped',
+                    'label_rule',
+                    'outside_grid_policy',
+                    'outside_grid_clipping_rule',
+                    'outside_grid_source_segment_ids',
+                    'num_outside_grid_segments_detected',
+                    'num_outside_grid_segments_retained',
+                    'num_outside_grid_segments_removed',
+                    'source_parent_segment_id',
+                    'task_id',
+                }
+                missing_clipped = clipped_required.difference(available)
+                if missing_clipped:
+                    raise ValueError(
+                        'Clipped atomic language contract is missing '
+                        f'{sorted(missing_clipped)}.'
+                    )
             manifest_task_ids = np.asarray(manifest['task_ids'], dtype=np.int32)
             manifest_task_ij = np.asarray(manifest['task_ij'], dtype=np.int32)
             manifest_coarse_ij = np.asarray(manifest['task_coarse_ij'], dtype=np.int32)
@@ -896,6 +1082,43 @@ class AtomicLanguageDataset(_AtomicSegmentDataset):
             segment_rows = np.asarray(manifest['grid_row'], dtype=np.int32)
             segment_columns = np.asarray(manifest['grid_column'], dtype=np.int32)
             outside = np.asarray(manifest['goal_outside_grid'], dtype=bool)
+            if contract_version == 2:
+                segment_goal_xyz = np.asarray(manifest['goal_xyz'], dtype=np.float32)
+                segment_task_ids = np.asarray(manifest['task_id'], dtype=np.int32)
+                clipped_flags = np.asarray(
+                    manifest['goal_label_was_clipped'], dtype=bool
+                )
+                source_parent_segment_ids = np.asarray(
+                    manifest['source_parent_segment_id'], dtype=np.int64
+                )
+                outside_source_segment_ids = np.asarray(
+                    manifest['outside_grid_source_segment_ids'], dtype=np.int64
+                )
+
+                def clipped_scalar(key, cast):
+                    value = np.asarray(manifest[key])
+                    if value.shape != ():
+                        raise ValueError(
+                            f'Clipped atomic language key {key!r} must be scalar.'
+                        )
+                    return cast(value.item())
+
+                manifest_outside_policy = clipped_scalar(
+                    'outside_grid_policy', str
+                )
+                manifest_clipping_rule = clipped_scalar(
+                    'outside_grid_clipping_rule', str
+                )
+                manifest_label_rule = clipped_scalar('label_rule', str)
+                num_outside_detected = clipped_scalar(
+                    'num_outside_grid_segments_detected', int
+                )
+                num_outside_retained = clipped_scalar(
+                    'num_outside_grid_segments_retained', int
+                )
+                num_outside_removed = clipped_scalar(
+                    'num_outside_grid_segments_removed', int
+                )
 
         expected_ids = np.arange(1, int(self.config['num_language_tasks']) + 1, dtype=np.int32)
         if not np.array_equal(manifest_task_ids, expected_ids):
@@ -932,8 +1155,127 @@ class AtomicLanguageDataset(_AtomicSegmentDataset):
         )
         if configured_spec_sha and manifest_spec_sha != configured_spec_sha:
             raise ValueError('Language task-spec SHA-256 does not match the configured artifact.')
-        if np.any(outside):
-            raise ValueError('Strict atomic language manifest contains an out-of-grid endpoint.')
+        if contract_version == 1:
+            if np.any(outside):
+                raise ValueError(
+                    'Strict atomic language manifest contains an out-of-grid endpoint.'
+                )
+            effective_outside_policy = 'reject'
+            num_outside_detected = 0
+            num_outside_retained = 0
+        else:
+            expected_policy = 'clip_to_nearest_boundary_cell'
+            expected_clipping_rule = 'coordinate_saturation_then_grid_cell_lookup'
+            expected_label_rule = 'stable_endpoint_grid135_boundary_clipped'
+            configured_policy = str(
+                self.config.get('atomic_outside_grid_policy', 'reject')
+            )
+            if manifest_outside_policy != expected_policy:
+                raise ValueError(
+                    'Clipped atomic language manifest has an unsupported outside-grid policy.'
+                )
+            if configured_policy != manifest_outside_policy:
+                raise ValueError(
+                    'Clipped atomic language manifest requires the matching explicit '
+                    'atomic_outside_grid_policy opt-in.'
+                )
+            if manifest_clipping_rule != expected_clipping_rule:
+                raise ValueError('Clipped atomic language manifest has an invalid clipping rule.')
+            if manifest_label_rule != expected_label_rule:
+                raise ValueError('Clipped atomic language manifest has an invalid label rule.')
+
+            num_segments = len(segment_rows)
+            one_per_segment = {
+                'grid_row': segment_rows,
+                'grid_column': segment_columns,
+                'goal_outside_grid': outside,
+                'goal_label_was_clipped': clipped_flags,
+                'source_parent_segment_id': source_parent_segment_ids,
+                'task_id': segment_task_ids,
+            }
+            malformed = {
+                key: value.shape
+                for key, value in one_per_segment.items()
+                if value.shape != (num_segments,)
+            }
+            if segment_goal_xyz.shape != (num_segments, 3):
+                malformed['goal_xyz'] = segment_goal_xyz.shape
+            if malformed:
+                raise ValueError(
+                    f'Clipped atomic language per-segment arrays are malformed: {malformed}.'
+                )
+            if not np.array_equal(
+                source_parent_segment_ids, np.arange(num_segments, dtype=np.int64)
+            ):
+                raise ValueError(
+                    'Clipped atomic language manifest must retain every parent segment in order.'
+                )
+            if np.any(segment_task_ids < 1) or np.any(
+                segment_task_ids > len(manifest_task_ij)
+            ):
+                raise ValueError(
+                    'Clipped atomic language manifest contains an invalid task ID.'
+                )
+
+            x = segment_goal_xyz[:, 0]
+            y = segment_goal_xyz[:, 1]
+            expected_outside = ~(
+                (manifest_x_edges[0] <= x)
+                & (x <= manifest_x_edges[-1])
+                & (manifest_y_edges[0] <= y)
+                & (y <= manifest_y_edges[-1])
+            )
+            expected_rows = np.searchsorted(
+                manifest_x_edges[1:-1], x, side='right'
+            )
+            expected_columns = np.searchsorted(
+                manifest_y_edges[1:-1], y, side='right'
+            )
+            expected_rows = np.clip(
+                expected_rows, 0, len(manifest_x_edges) - 2
+            ).astype(np.int32)
+            expected_columns = np.clip(
+                expected_columns, 0, len(manifest_y_edges) - 2
+            ).astype(np.int32)
+            if not np.array_equal(outside, expected_outside):
+                raise ValueError(
+                    'Clipped atomic language outside-grid flags disagree with goal_xyz.'
+                )
+            if not np.array_equal(clipped_flags, expected_outside):
+                raise ValueError(
+                    'Clipped atomic language semantic flags disagree with goal_xyz.'
+                )
+            if not np.array_equal(segment_rows, expected_rows) or not np.array_equal(
+                segment_columns, expected_columns
+            ):
+                raise ValueError(
+                    'Clipped atomic language cells disagree with coordinate saturation.'
+                )
+            expected_segment_cells = manifest_task_ij[segment_task_ids - 1]
+            if not np.array_equal(
+                expected_segment_cells,
+                np.stack([segment_rows, segment_columns], axis=1),
+            ):
+                raise ValueError(
+                    'Clipped atomic language task IDs disagree with clipped cells.'
+                )
+            expected_outside_source_ids = source_parent_segment_ids[expected_outside]
+            if not np.array_equal(
+                outside_source_segment_ids, expected_outside_source_ids
+            ):
+                raise ValueError(
+                    'Clipped atomic language outside-source IDs are inconsistent.'
+                )
+            actual_outside = int(np.sum(expected_outside))
+            if (
+                num_outside_detected != actual_outside
+                or num_outside_retained != actual_outside
+                or num_outside_removed != 0
+            ):
+                raise ValueError(
+                    'Clipped atomic language outside-grid counts are inconsistent.'
+                )
+            effective_outside_policy = manifest_outside_policy
         expected_cells = manifest_task_ij[
             np.asarray(self.transition_task_ids, dtype=np.int64) - 1
         ]
@@ -949,9 +1291,14 @@ class AtomicLanguageDataset(_AtomicSegmentDataset):
         self.manifest_summary.update(
             {
                 'language_contract_verified': True,
-                'language_contract_schema_version': 1,
+                'language_contract_schema_version': contract_version,
                 'task_spec_sha256': manifest_spec_sha,
                 'num_language_tasks': int(len(manifest_task_ids)),
+                'outside_grid_policy': effective_outside_policy,
+                'num_outside_grid_segments': int(num_outside_retained),
+                'num_outside_grid_transitions': int(
+                    np.sum(outside[self.transition_segment_ids])
+                ),
                 'grid_shape': [
                     int(len(manifest_x_edges) - 1),
                     int(len(manifest_y_edges) - 1),
@@ -1546,6 +1893,285 @@ class AtomicBYOLDataset(AtomicGCDataset):
                         self._byol_effective_offset_sum / count
                     ),
                     'data/atomic_byol_endpoint_fraction': self._byol_endpoint_count / count,
+                }
+            )
+        self._byol_sample_count = 0
+        self._byol_requested_offset_sum = 0
+        self._byol_effective_offset_sum = 0
+        self._byol_endpoint_count = 0
+        return metrics
+
+
+@dataclasses.dataclass
+class AtomicGoalImageBYOLDataset(AtomicGCDataset):
+    """Visual GCBC samples with a separate within-segment BYOL target.
+
+    ``actor_goals`` remain the repeated stable endpoint images used by
+    :class:`AtomicGCDataset`.  ``value_goals`` are actual temporal frame stacks
+    sampled later in the same atomic movement and are training-only inputs to
+    the auxiliary prediction loss.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        discount = float(self.config['discount'])
+        if not 0.0 <= discount < 1.0:
+            raise ValueError(
+                'AtomicGoalImageBYOLDataset discount must lie in [0, 1).'
+            )
+        if not bool(self.config['value_geom_sample']):
+            raise ValueError(
+                'AtomicGoalImageBYOLDataset requires value_geom_sample=True.'
+            )
+
+        split_id = {'train': 0, 'val': 1}.get(self.source_split, 2)
+        run_seed = int(self.config.get('run_seed', 0))
+        self._byol_value_rng = np.random.default_rng(
+            np.random.SeedSequence([run_seed, 0xB10A, split_id])
+        )
+        self._byol_aug_rng = np.random.default_rng(
+            np.random.SeedSequence([run_seed, 0xB10B, split_id])
+        )
+        self._byol_sample_count = 0
+        self._byol_requested_offset_sum = 0
+        self._byol_effective_offset_sum = 0
+        self._byol_endpoint_count = 0
+        self.manifest_summary.update(
+            {
+                'byol_value_goal_sampling': (
+                    'clipped_geometric_within_atomic_segment'
+                ),
+                'byol_discount': discount,
+                'byol_rng_seed': run_seed,
+                'byol_actor_conditioning': 'stable_endpoint_goal_image',
+                'byol_frame_stack_mode': (
+                    'temporal_stack_at_sampled_future_state'
+                ),
+            }
+        )
+
+    def _augment_visual_inputs(self, batch):
+        """Preserve GCBC augmentation draws and isolate the extra target draw."""
+        aug_type = self.config.get('aug_type', 'crop')
+        ordinary_keys = ['observations', 'next_observations', 'actor_goals']
+        if aug_type == 'drq_shift':
+            pad = self.config.get('drq_shift_pad', 2)
+            random_shifts_batch(batch, ordinary_keys, pad=pad)
+            random_shifts_batch(
+                batch,
+                ['value_goals'],
+                pad=pad,
+                rng=self._byol_aug_rng,
+            )
+        else:
+            # Crop augmentation uses one crop for all keys and therefore does
+            # not consume extra global random draws for the auxiliary target.
+            self.augment(batch, ordinary_keys + ['value_goals'])
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        batch, _, atomic_idxs = self._sample_atomic(
+            batch_size,
+            idxs=idxs,
+            evaluation=evaluation,
+            augment_keys=None,
+        )
+        raw_idxs = self.transition_indices[atomic_idxs]
+        segment_ids = self.transition_segment_ids[atomic_idxs]
+        endpoint_idxs = self.segment_goal_indices[segment_ids]
+
+        requested_offsets = self._byol_value_rng.geometric(
+            p=1.0 - float(self.config['discount']),
+            size=len(raw_idxs),
+        )
+        value_goal_idxs = np.minimum(raw_idxs + requested_offsets, endpoint_idxs)
+        if np.any(value_goal_idxs <= raw_idxs) or np.any(
+            value_goal_idxs > endpoint_idxs
+        ):
+            raise RuntimeError(
+                'Atomic goal-image BYOL target escaped its declared segment bounds.'
+            )
+
+        batch['value_goals'] = self.get_observations(value_goal_idxs)
+        batch['actor_goals'] = self._get_endpoint_goals(endpoint_idxs)
+        successes = (raw_idxs == value_goal_idxs).astype(float)
+        batch['masks'] = 1.0 - successes
+        batch['rewards'] = successes - (
+            1.0 if self.config['gc_negative'] else 0.0
+        )
+
+        if not evaluation:
+            effective_offsets = value_goal_idxs - raw_idxs
+            self._byol_sample_count += len(raw_idxs)
+            self._byol_requested_offset_sum += int(np.sum(requested_offsets))
+            self._byol_effective_offset_sum += int(np.sum(effective_offsets))
+            self._byol_endpoint_count += int(
+                np.sum(value_goal_idxs == endpoint_idxs)
+            )
+
+        if self.config['p_aug'] is not None and not evaluation:
+            if np.random.rand() < self.config['p_aug']:
+                self._augment_visual_inputs(batch)
+        return batch
+
+    def get_and_reset_diagnostics(self):
+        count = self._byol_sample_count
+        metrics = {'data/atomic_byol_samples': float(count)}
+        if count:
+            metrics.update(
+                {
+                    'data/atomic_byol_requested_offset_mean': (
+                        self._byol_requested_offset_sum / count
+                    ),
+                    'data/atomic_byol_effective_offset_mean': (
+                        self._byol_effective_offset_sum / count
+                    ),
+                    'data/atomic_byol_endpoint_fraction': (
+                        self._byol_endpoint_count / count
+                    ),
+                }
+            )
+        self._byol_sample_count = 0
+        self._byol_requested_offset_sum = 0
+        self._byol_effective_offset_sum = 0
+        self._byol_endpoint_count = 0
+        return metrics
+
+
+@dataclasses.dataclass
+class AtomicGoalLanguageBYOLDataset(AtomicGoalLanguageDataset):
+    """Image+Language BC samples with a separate visual BYOL target.
+
+    The actor receives the same stable endpoint image and matching language
+    embedding as :class:`AtomicGoalLanguageDataset`.  ``value_goals`` is an
+    additional within-segment future image stack used only by BYOL.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        discount = float(self.config['discount'])
+        if not 0.0 <= discount < 1.0:
+            raise ValueError(
+                'AtomicGoalLanguageBYOLDataset discount must lie in [0, 1).'
+            )
+        if not bool(self.config['value_geom_sample']):
+            raise ValueError(
+                'AtomicGoalLanguageBYOLDataset requires value_geom_sample=True.'
+            )
+
+        split_id = {'train': 0, 'val': 1}.get(self.source_split, 2)
+        run_seed = int(self.config.get('run_seed', 0))
+        self._byol_value_rng = np.random.default_rng(
+            np.random.SeedSequence([run_seed, 0xB10A, split_id])
+        )
+        self._byol_aug_rng = np.random.default_rng(
+            np.random.SeedSequence([run_seed, 0xB10B, split_id])
+        )
+        self._byol_sample_count = 0
+        self._byol_requested_offset_sum = 0
+        self._byol_effective_offset_sum = 0
+        self._byol_endpoint_count = 0
+        self.manifest_summary.update(
+            {
+                'byol_value_goal_sampling': (
+                    'clipped_geometric_within_atomic_segment'
+                ),
+                'byol_discount': discount,
+                'byol_rng_seed': run_seed,
+                'byol_actor_conditioning': (
+                    'same_segment_stable_endpoint_image_and_language'
+                ),
+                'byol_auxiliary_conditioning': (
+                    'visual_observation_and_stable_endpoint_only'
+                ),
+                'byol_frame_stack_mode': (
+                    'temporal_stack_at_sampled_future_state'
+                ),
+            }
+        )
+
+    def _augment_visual_inputs(self, batch):
+        """Preserve ordinary actor-input draws; isolate the extra target draw."""
+        aug_type = self.config.get('aug_type', 'crop')
+        ordinary_keys = ['observations', 'next_observations', 'actor_goals']
+        if aug_type == 'drq_shift':
+            pad = self.config.get('drq_shift_pad', 2)
+            random_shifts_batch(batch, ordinary_keys, pad=pad)
+            random_shifts_batch(
+                batch,
+                ['value_goals'],
+                pad=pad,
+                rng=self._byol_aug_rng,
+            )
+        else:
+            # Crop augmentation shares one crop across keys and consumes no
+            # extra global draw when the auxiliary image is appended.
+            self.augment(batch, ordinary_keys + ['value_goals'])
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        batch, task_ids, atomic_idxs = self._sample_atomic(
+            batch_size,
+            idxs=idxs,
+            evaluation=evaluation,
+            augment_keys=None,
+        )
+        raw_idxs = self.transition_indices[atomic_idxs]
+        segment_ids = self.transition_segment_ids[atomic_idxs]
+        endpoint_idxs = self.segment_goal_indices[segment_ids]
+
+        requested_offsets = self._byol_value_rng.geometric(
+            p=1.0 - float(self.config['discount']),
+            size=len(raw_idxs),
+        )
+        value_goal_idxs = np.minimum(raw_idxs + requested_offsets, endpoint_idxs)
+        if np.any(value_goal_idxs <= raw_idxs) or np.any(
+            value_goal_idxs > endpoint_idxs
+        ):
+            raise RuntimeError(
+                'Atomic goal-language BYOL target escaped its segment bounds.'
+            )
+
+        batch['value_goals'] = self.get_observations(value_goal_idxs)
+        batch['actor_goals'] = self._get_endpoint_goals(endpoint_idxs)
+        successes = (raw_idxs == value_goal_idxs).astype(float)
+        batch['masks'] = 1.0 - successes
+        batch['rewards'] = successes - (
+            1.0 if self.config['gc_negative'] else 0.0
+        )
+
+        if not evaluation:
+            effective_offsets = value_goal_idxs - raw_idxs
+            self._byol_sample_count += len(raw_idxs)
+            self._byol_requested_offset_sum += int(np.sum(requested_offsets))
+            self._byol_effective_offset_sum += int(np.sum(effective_offsets))
+            self._byol_endpoint_count += int(
+                np.sum(value_goal_idxs == endpoint_idxs)
+            )
+
+        # Match AtomicGoalLanguageDataset ordering: language is attached before
+        # the ordinary visual augmentation draw.  BYOL-only randomness stays
+        # on the isolated generators above.
+        _attach_language_condition(self, batch, task_ids, evaluation)
+        if self.config['p_aug'] is not None and not evaluation:
+            if np.random.rand() < self.config['p_aug']:
+                self._augment_visual_inputs(batch)
+        return batch
+
+    def get_and_reset_diagnostics(self):
+        metrics = _get_and_reset_language_diagnostics(self)
+        count = self._byol_sample_count
+        metrics['data/atomic_byol_samples'] = float(count)
+        if count:
+            metrics.update(
+                {
+                    'data/atomic_byol_requested_offset_mean': (
+                        self._byol_requested_offset_sum / count
+                    ),
+                    'data/atomic_byol_effective_offset_mean': (
+                        self._byol_effective_offset_sum / count
+                    ),
+                    'data/atomic_byol_endpoint_fraction': (
+                        self._byol_endpoint_count / count
+                    ),
                 }
             )
         self._byol_sample_count = 0

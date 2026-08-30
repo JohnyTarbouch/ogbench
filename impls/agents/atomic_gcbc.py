@@ -20,6 +20,10 @@ def get_config():
                 atomic_val_manifest_sha256='',
                 atomic_goal_stack_mode='repeat_endpoint',
                 atomic_require_source_fingerprint=False,
+                atomic_transition_reuse_policy='forbid',
+                atomic_sampling_mode='uniform_transition',
+                atomic_sampling_family_ids=(),
+                atomic_sampling_family_probabilities=(),
             )
         )
     )
