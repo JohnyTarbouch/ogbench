@@ -25,7 +25,9 @@ from utils.datasets import (
     AtomicGoalLanguageDataset,
     AtomicLanguageBYOLDataset,
     AtomicLanguageDataset,
+    CompositeGoalLanguageBYOLDataset,
     CompositeGoalLanguageDataset,
+    CompositeLanguageBYOLDataset,
     CompositeLanguageDataset,
     Dataset,
     EndpointGoalDataset,
@@ -415,7 +417,9 @@ def main(_):
         'AtomicGoalLanguageDataset': AtomicGoalLanguageDataset,
         'AtomicLanguageBYOLDataset': AtomicLanguageBYOLDataset,
         'AtomicLanguageDataset': AtomicLanguageDataset,
+        'CompositeGoalLanguageBYOLDataset': CompositeGoalLanguageBYOLDataset,
         'CompositeGoalLanguageDataset': CompositeGoalLanguageDataset,
+        'CompositeLanguageBYOLDataset': CompositeLanguageBYOLDataset,
         'CompositeLanguageDataset': CompositeLanguageDataset,
         'EndpointGoalDataset': EndpointGoalDataset, # sample within an atomic episode (exclude final img)
         'EndpointInclusiveGCDataset': EndpointInclusiveGCDataset, # enable sampling final img
@@ -439,7 +443,9 @@ def main(_):
         AtomicGoalLanguageDataset,
         AtomicLanguageBYOLDataset,
         AtomicLanguageDataset,
+        CompositeGoalLanguageBYOLDataset,
         CompositeGoalLanguageDataset,
+        CompositeLanguageBYOLDataset,
         CompositeLanguageDataset,
     }:
         train_dataset_kwargs['manifest_path'] = config['atomic_train_manifest_path']
@@ -477,7 +483,9 @@ def main(_):
             AtomicGoalLanguageDataset,
             AtomicLanguageBYOLDataset,
             AtomicLanguageDataset,
+            CompositeGoalLanguageBYOLDataset,
             CompositeGoalLanguageDataset,
+            CompositeLanguageBYOLDataset,
             CompositeLanguageDataset,
         }:
             val_dataset_kwargs['manifest_path'] = config['atomic_val_manifest_path']

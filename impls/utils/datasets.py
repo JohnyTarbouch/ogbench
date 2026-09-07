@@ -2309,6 +2309,110 @@ class AtomicLanguageBYOLDataset(AtomicLanguageDataset):
         return metrics
 
 
+@dataclasses.dataclass
+class CompositeLanguageBYOLDataset(CompositeLanguageDataset):
+    """Ordered LCBC with segment-wide geometric BYOL targets."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.segment_goal_indices is None:
+            raise ValueError(
+                'CompositeLanguageBYOLDataset requires composite goal_index.'
+            )
+        discount = float(self.config['discount'])
+        if not 0.0 <= discount < 1.0:
+            raise ValueError(
+                'CompositeLanguageBYOLDataset discount must lie in [0, 1).'
+            )
+        if not bool(self.config['value_geom_sample']):
+            raise ValueError(
+                'CompositeLanguageBYOLDataset requires value_geom_sample=True.'
+            )
+
+        split_id = {'train': 0, 'val': 1}.get(self.source_split, 2)
+        run_seed = int(self.config.get('run_seed', 0))
+        self._byol_value_rng = np.random.default_rng(
+            np.random.SeedSequence([run_seed, 0xB10A, split_id])
+        )
+        self._byol_aug_rng = np.random.default_rng(
+            np.random.SeedSequence([run_seed, 0xB10B, split_id])
+        )
+        self._byol_sample_count = 0
+        self._byol_requested_offset_sum = 0
+        self._byol_effective_offset_sum = 0
+        self._byol_endpoint_count = 0
+        self.manifest_summary.update(
+            {
+                'byol_dataset_scope': 'composite_multi_horizon',
+                'byol_value_goal_sampling': (
+                    'clipped_geometric_within_composite_segment'
+                ),
+                'byol_discount': discount,
+                'byol_rng_seed': run_seed,
+                'byol_actor_conditioning': 'full_ordered_language',
+                'byol_auxiliary_conditioning': 'observation_only',
+                'byol_frame_stack_mode': 'temporal_stack_at_sampled_future_state',
+            }
+        )
+
+    _augment_visual_inputs = AtomicLanguageBYOLDataset._augment_visual_inputs
+    sample = AtomicLanguageBYOLDataset.sample
+    get_and_reset_diagnostics = AtomicLanguageBYOLDataset.get_and_reset_diagnostics
+
+
+@dataclasses.dataclass
+class CompositeGoalLanguageBYOLDataset(CompositeGoalLanguageDataset):
+    """Image+Lang BC with geometric BYOl targets."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        discount = float(self.config['discount'])
+        if not 0.0 <= discount < 1.0:
+            raise ValueError(
+                'CompositeGoalLanguageBYOLDataset discount must lie in [0, 1).'
+            )
+        if not bool(self.config['value_geom_sample']):
+            raise ValueError(
+                'CompositeGoalLanguageBYOLDataset requires value_geom_sample=True.'
+            )
+
+        split_id = {'train': 0, 'val': 1}.get(self.source_split, 2)
+        run_seed = int(self.config.get('run_seed', 0))
+        self._byol_value_rng = np.random.default_rng(
+            np.random.SeedSequence([run_seed, 0xB10A, split_id])
+        )
+        self._byol_aug_rng = np.random.default_rng(
+            np.random.SeedSequence([run_seed, 0xB10B, split_id])
+        )
+        self._byol_sample_count = 0
+        self._byol_requested_offset_sum = 0
+        self._byol_effective_offset_sum = 0
+        self._byol_endpoint_count = 0
+        self.manifest_summary.update(
+            {
+                'byol_dataset_scope': 'composite_multi_horizon',
+                'byol_value_goal_sampling': (
+                    'clipped_geometric_within_composite_segment'
+                ),
+                'byol_discount': discount,
+                'byol_rng_seed': run_seed,
+                'byol_actor_conditioning': (
+                    'composite_final_endpoint_image_and_full_ordered_language'
+                ),
+                'byol_auxiliary_conditioning': (
+                    'visual_observation_and_composite_final_endpoint_only'
+                ),
+                'byol_frame_stack_mode': 'temporal_stack_at_sampled_future_state',
+            }
+        )
+
+    _augment_visual_inputs = AtomicGoalLanguageBYOLDataset._augment_visual_inputs
+    sample = AtomicGoalLanguageBYOLDataset.sample
+    get_and_reset_diagnostics = (
+        AtomicGoalLanguageBYOLDataset.get_and_reset_diagnostics
+    )
+
+
 def _actions_valids_fingerprint(dataset):
     digest = hashlib.sha256()
     for key in ('actions', 'valids'):
