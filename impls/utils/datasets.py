@@ -959,6 +959,39 @@ class _AtomicSegmentDataset(GCDataset):
                 }
             )
 
+        self._byol_late_window_starts = None
+        late_fraction = float(self.config.get('byol_late_fraction', 0.0))
+        if not np.isfinite(late_fraction) or not 0.0 <= late_fraction <= 1.0:
+            raise ValueError('byol_late_fraction must be finite and in [0, 1].')
+        if late_fraction > 0.0:
+            from utils.byol_late import late_window_starts
+
+            if type(self).__name__ not in {
+                'AtomicGoalImageBYOLDataset',
+                'AtomicLanguageBYOLDataset',
+                'AtomicGoalLanguageBYOLDataset',
+            }:
+                raise ValueError('Late BYOL requires a supported atomic visual BYOL dataset.')
+            if segment_start_indices is None or segment_goal_indices is None:
+                raise ValueError('Late BYOL requires declared movement starts and endpoints.')
+            if self.config.get('pred_loss_type') != 'bdino':
+                raise ValueError('Late BYOL currently supports bdino only.')
+            self._byol_late_window_starts = late_window_starts(
+                segment_start_indices, segment_goal_indices, late_fraction
+            )
+            active_count = int(np.sum(
+                transition_indices >= self._byol_late_window_starts[transition_segment_ids]
+            ))
+            self.manifest_summary['byol_late_gate'] = {
+                'fraction': late_fraction,
+                'rounding': 'final_ceil_fraction_times_segment_length_action_rows',
+                'active_transitions': active_count,
+                'active_fraction': active_count / self.size,
+                'normalization': 'mean_over_active_rows_and_ensembles',
+                'bc_sampling': 'unchanged_full_movement',
+                'direction_mask': 'original_sampled_action_for_both_directions',
+            }
+
     def _sample_atomic(self, batch_size, idxs=None, evaluation=False, augment_keys=None):
         """Sample transitions and their internal language-task labels."""
         if idxs is None:
@@ -987,6 +1020,11 @@ class _AtomicSegmentDataset(GCDataset):
 
         raw_idxs = self.transition_indices[idxs]
         batch = self.dataset.sample(len(idxs), raw_idxs)
+        if self._byol_late_window_starts is not None:
+            segment_ids = self.transition_segment_ids[idxs]
+            batch['byol_sample_weights'] = (
+                raw_idxs >= self._byol_late_window_starts[segment_ids]
+            ).astype(np.float32)
         if self.config['frame_stack'] is not None:
             batch['observations'] = self.get_observations(raw_idxs)
             batch['next_observations'] = self.get_observations(raw_idxs + 1)

@@ -24,6 +24,7 @@ from agents.language_bc import get_config as get_language_config
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState
 from utils.networks import GCActor, GCDiscreteActor, MLP
+from utils.byol_late import sample_weights, weight_metrics, weighted_bdino
 
 
 # Keep the prediction architecture and policy-representation enum identical to
@@ -66,6 +67,7 @@ class LanguageBYOLAgent(BYOLAgent):
         grad_params,
         module_name='value',
         use_backwards=False,
+        sample_weights=None,
     ):
         """Apply the pinned Byol objective to features from the shared encoder."""
         target_features = self.network.select('encoder')(
@@ -104,12 +106,50 @@ class LanguageBYOLAgent(BYOLAgent):
         if phi.ndim == 2:
             phi = phi[None, ...]
             psi = psi[None, ...]
-        pred_loss, pred_stats = self.compute_pred_loss(
-            psi,
-            phi,
-            loss_type=self.config['pred_loss_type'],
-        )
+        if sample_weights is None:
+            pred_loss, pred_stats = self.compute_pred_loss(
+                psi, phi, loss_type=self.config['pred_loss_type'],
+            )
+        else:
+            if self.config['pred_loss_type'] != 'bdino':
+                raise ValueError('Late BYOL currently supports bdino only.')
+            pred_loss = weighted_bdino(psi, phi, sample_weights)
+            pred_stats = {}
         return pred_loss, {'pred_loss': pred_loss}, pred_stats
+
+    @jax.jit
+    def total_loss(self, batch, grad_params, rng=None):
+        weights = sample_weights(batch, self.config)
+        if weights is None:
+            return super().total_loss(batch, grad_params, rng)
+        info = weight_metrics(weights)
+        prediction_loss = 0.0
+        directions = (
+            (False, True) if self.config['pred_both']
+            else (bool(self.config['pred_backwards']),)
+        )
+        for backwards in directions:
+            first, second = ('value_goals', 'observations') if backwards else (
+                'observations', 'value_goals'
+            )
+            loss, diagnostics, _ = self.pred_loss(
+                batch[first], batch[second], batch['actions'], grad_params,
+                
+                use_backwards=backwards and self.config['pred_both'],
+                sample_weights=weights,
+            )
+            prefix = 'pred_b' if backwards else 'pred_f'
+            info.update({f'{prefix}/{key}': value for key, value in diagnostics.items()})
+            prediction_loss = prediction_loss + loss
+        rng = rng if rng is not None else self.rng
+        _, actor_rng = jax.random.split(rng)
+        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        info.update({f'actor/{key}': value for key, value in actor_info.items()})
+        info['stats'] = {}
+        return (
+            self.config['bc_weight'] * actor_loss
+            + self.config['alignment'] * prediction_loss
+        ), info
 
     def target_update(self, network, module_name):
         """EMA-update both parts of the split target representation stack."""
@@ -329,6 +369,7 @@ def get_config():
                 agent_name='language_byol_gamma',
                 dataset_class='AtomicLanguageBYOLDataset',
                 policy_conditioning='language',
+                byol_late_fraction=0.0,
                 language_dataset_mode='atomic_movement',
                 # Preserve the typed placeholder used by absl/ml_collections;
                 # copying its resolved value from LanguageBCAgent would turn it

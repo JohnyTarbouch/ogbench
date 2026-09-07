@@ -22,6 +22,7 @@ from agents.gcbc import GCBCAgent, get_config as get_gcbc_config
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState
 from utils.networks import GCActor, GCDiscreteActor
+from utils.byol_late import sample_weights, weight_metrics, weighted_bdino
 
 
 GCPredValue = _REFERENCE_BYOL.GCPredValue
@@ -48,6 +49,7 @@ class GoalImageBYOLAgent(BYOLAgent):
         grad_params,
         module_name='value',
         use_backwards=False,
+        sample_weights=None,
     ):
         """Predict a future pair representation with the endpoint goal fixed."""
         target_features = self._pair_representation(
@@ -92,11 +94,15 @@ class GoalImageBYOLAgent(BYOLAgent):
         if phi.ndim == 2:
             phi = phi[None, ...]
             psi = psi[None, ...]
-        pred_loss, pred_stats = self.compute_pred_loss(
-            psi,
-            phi,
-            loss_type=self.config['pred_loss_type'],
-        )
+        if sample_weights is None:
+            pred_loss, pred_stats = self.compute_pred_loss(
+                psi, phi, loss_type=self.config['pred_loss_type'],
+            )
+        else:
+            if self.config['pred_loss_type'] != 'bdino':
+                raise ValueError('Late BYOL currently supports bdino only.')
+            pred_loss = weighted_bdino(psi, phi, sample_weights)
+            pred_stats = {}
         return pred_loss, {'pred_loss': pred_loss}, pred_stats
 
     def target_update(self, network, module_name):
@@ -133,6 +139,9 @@ class GoalImageBYOLAgent(BYOLAgent):
         """Combine matched GCBC and forward/backward BYOL loss"""
         del rng
         info = {}
+        weights = sample_weights(batch, self.config)
+        if weights is not None:
+            info.update(weight_metrics(weights))
         if self.config['pred_both']:
             forward_loss, forward_info, _ = self.pred_loss(
                 batch['observations'],
@@ -140,6 +149,7 @@ class GoalImageBYOLAgent(BYOLAgent):
                 batch['actor_goals'],
                 batch['actions'],
                 grad_params,
+                sample_weights=weights,
             )
             backward_loss, backward_info, _ = self.pred_loss(
                 batch['value_goals'],
@@ -148,6 +158,7 @@ class GoalImageBYOLAgent(BYOLAgent):
                 batch['actions'],
                 grad_params,
                 use_backwards=True,
+                sample_weights=weights,
             )
             info.update({f'pred_f/{key}': value for key, value in forward_info.items()})
             info.update({f'pred_b/{key}': value for key, value in backward_info.items()})
@@ -160,6 +171,7 @@ class GoalImageBYOLAgent(BYOLAgent):
                 batch['actions'],
                 grad_params,
                 use_backwards=True,
+                sample_weights=weights,
             )
             info.update({f'pred_b/{key}': value for key, value in prediction_info.items()})
         else:
@@ -169,6 +181,7 @@ class GoalImageBYOLAgent(BYOLAgent):
                 batch['actor_goals'],
                 batch['actions'],
                 grad_params,
+                sample_weights=weights,
             )
             info.update({f'pred_f/{key}': value for key, value in prediction_info.items()})
 
@@ -346,6 +359,7 @@ def get_config():
                 agent_name='goal_image_byol_gamma',
                 dataset_class='AtomicGoalImageBYOLDataset',
                 policy_conditioning='goal_image',
+                byol_late_fraction=0.0,
             )
         )
     )
