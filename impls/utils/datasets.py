@@ -460,6 +460,19 @@ def _initialize_language_conditioning(owner):
     train_control = str(owner.config.get('language_train_control', 'none'))
     if train_control not in {'none', 'zero'}:
         raise ValueError("language_train_control must be 'none' or 'zero'.")
+    variant_seed = owner.config.get('language_variant_seed', None)
+    if variant_seed is not None:
+        if (
+            isinstance(variant_seed, (bool, np.bool_))
+            or not isinstance(variant_seed, (int, np.integer))
+            or variant_seed < 0
+        ):
+            raise ValueError('language_variant_seed must be None or a nonnegative integer.')
+        variant_seed = int(variant_seed)
+    
+    owner._language_variant_rng = (
+        None if variant_seed is None else np.random.default_rng(variant_seed)
+    )
     owner.language_cache = cache
     owner.language_train_variant = train_variant
     owner.language_train_control = train_control
@@ -476,6 +489,8 @@ def _initialize_language_conditioning(owner):
         'embedding_dim': int(cache['canonical_embeddings'].shape[-1]),
         'train_variant': train_variant,
         'train_control': train_control,
+        'language_variant_seed': variant_seed,
+        'language_variant_rng': 'global_numpy' if variant_seed is None else 'independent_default_rng',
         'train_variants_per_task': int(cache['train_embeddings'].shape[1]),
         'heldout_variants_per_task': int(cache['heldout_embeddings'].shape[1]),
         'train_retrieval_top1': retrieval['train'],
@@ -504,7 +519,11 @@ def _attach_language_condition(owner, batch, task_ids, evaluation):
         variant_idxs = np.zeros(len(task_rows), dtype=np.int32)
     else:
         num_variants = owner.language_cache['train_embeddings'].shape[1]
-        variant_idxs = np.random.randint(num_variants, size=len(task_rows)).astype(np.int32)
+        variant_rng = getattr(owner, '_language_variant_rng', None)
+        if variant_rng is None:
+            variant_idxs = np.random.randint(num_variants, size=len(task_rows)).astype(np.int32)
+        else:
+            variant_idxs = variant_rng.integers(num_variants, size=len(task_rows)).astype(np.int32)
         embeddings = owner.language_cache['train_embeddings'][task_rows, variant_idxs]
     if not evaluation:
         np.add.at(owner._language_task_counts, task_rows, 1)

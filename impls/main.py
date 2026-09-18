@@ -237,6 +237,12 @@ def _goal_sampling_summary(config):
         'policy_conditioning',
         'discount',
         'alignment',
+        'task_alignment',
+        'task_temperature',
+        'tra_nce_reduction',
+        'tra_task_nce_reduction',
+        'tra_task_bank',
+        'tra_actor_contract',
         'bc_weight',
         'target',
         'tau',
@@ -277,6 +283,8 @@ def _goal_sampling_summary(config):
         'language_min_train_retrieval_top1',
         'language_min_heldout_retrieval_top1',
         'language_train_variant',
+        'language_variant_seed',
+        'bc_initialization_contract',
         'language_train_control',
         'language_eval_variants',
         'language_final_eval_variants',
@@ -409,7 +417,12 @@ def main(_):
         },
     )
 
+    AtomicTRADataset = None
+    if config['dataset_class'] == 'AtomicTRADataset':
+        from utils.atomic_tra_dataset import AtomicTRADataset
+
     dataset_class = {
+        'AtomicTRADataset': AtomicTRADataset,
         'AtomicBYOLDataset': AtomicBYOLDataset,
         'AtomicGCDataset': AtomicGCDataset,
         'AtomicGoalImageBYOLDataset': AtomicGoalImageBYOLDataset,
@@ -436,6 +449,7 @@ def main(_):
     # set up training dataset with arguments
     train_dataset_kwargs = {}
     if dataset_class in {
+        AtomicTRADataset,
         AtomicBYOLDataset,
         AtomicGCDataset,
         AtomicGoalImageBYOLDataset,
@@ -476,6 +490,7 @@ def main(_):
         # set up validation dataset with arguments
         val_dataset_kwargs = {}
         if val_dataset_class in {
+            AtomicTRADataset,
             AtomicBYOLDataset,
             AtomicGCDataset,
             AtomicGoalImageBYOLDataset,
@@ -545,6 +560,10 @@ def main(_):
         from agents.goal_image_byol import GoalImageBYOLAgent
 
         agent_class = GoalImageBYOLAgent
+    elif config['agent_name'] == 'atomic_tra':
+        from agents.atomic_tra import AtomicTRAAgent
+
+        agent_class = AtomicTRAAgent
     elif config['agent_name'] == 'goal_image_tra':
         from agents.goal_image_tra import GoalImageTRAAgent
 
@@ -553,6 +572,10 @@ def main(_):
         from agents.goal_language_byol import GoalLanguageBYOLAgent
 
         agent_class = GoalLanguageBYOLAgent
+    elif config['agent_name'] == 'language_byol_matched_bc':
+        from agents.language_byol_matched_bc import LanguageBYOLMatchedBCAgent
+
+        agent_class = LanguageBYOLMatchedBCAgent
     elif config['agent_name'] == 'language_byol_gamma':
         from agents.language_byol import LanguageBYOLAgent
 
@@ -570,6 +593,7 @@ def main(_):
         'goal_image_byol_gamma',
         'goal_language_byol_gamma',
         'language_byol_gamma',
+        'language_byol_matched_bc',
     }:
         from agents.byol import get_reference_provenance
 
